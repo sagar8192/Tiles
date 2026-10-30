@@ -1,0 +1,10 @@
+# Build & runtime artifacts
+.build/
+.swiftpm/
+Tiles.app/
+TilesData/
+
+# macOS system files
+.DS_Store
+*.xcuserdata
+*.xcworkspace
