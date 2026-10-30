@@ -80,6 +80,10 @@ public struct WindowSnapshotInfo: Codable, Identifiable, Equatable {
     public let spaceIndex: Int
     public let isFullscreen: Bool
 
+    public var appKey: String {
+        ((bundleIdentifier?.isEmpty == false) ? bundleIdentifier! : ownerName).lowercased()
+    }
+
     public init(
         windowNumber: Int,
         ownerPID: Int32,
@@ -151,23 +155,46 @@ public struct CGRectCodable: Codable, Equatable {
     }
 }
 
+/// Identifies a specific Desktop (Space) on a specific Display by 1-based index.
+public struct SpaceRef: Hashable, Codable, Equatable, Sendable {
+    public var displayUUID: String
+    public var spaceIndex: Int
+
+    public init(displayUUID: String, spaceIndex: Int) {
+        self.displayUUID = displayUUID
+        self.spaceIndex = spaceIndex
+    }
+}
+
 /// A complete Mac-wide snapshot taken at a point in time across all displays and desktops.
 public struct MacSnapshot: Codable, Identifiable, Equatable {
     public let id: String
     public let capturedAt: Date
     public let topologyKey: String
     public var displays: [DisplaySnapshotInfo]
+    public var isManual: Bool
 
     public init(
         id: String = UUID().uuidString,
         capturedAt: Date = Date(),
         topologyKey: String,
-        displays: [DisplaySnapshotInfo]
+        displays: [DisplaySnapshotInfo],
+        isManual: Bool = false
     ) {
         self.id = id
         self.capturedAt = capturedAt
         self.topologyKey = topologyKey
         self.displays = displays
+        self.isManual = isManual
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.capturedAt = try container.decode(Date.self, forKey: .capturedAt)
+        self.topologyKey = try container.decode(String.self, forKey: .topologyKey)
+        self.displays = try container.decode([DisplaySnapshotInfo].self, forKey: .displays)
+        self.isManual = (try? container.decode(Bool.self, forKey: .isManual)) ?? false
     }
 
     public var totalDesktopCount: Int {
@@ -178,5 +205,38 @@ public struct MacSnapshot: Codable, Identifiable, Equatable {
         displays.reduce(0) { acc, disp in
             acc + disp.spaces.reduce(0) { $0 + $1.windows.count }
         }
+    }
+
+    /// Same apps with windows in the same places, ignoring sub-4 pt jitter and window IDs.
+    public func isEquivalent(to other: MacSnapshot) -> Bool {
+        topologyKey == other.topologyKey && fingerprint == other.fingerprint
+    }
+
+    public var fingerprint: [String] {
+        displays.flatMap { $0.spaces.flatMap(\.windows) }.map { w in
+            let q = { (v: Double) in Int((v / 4).rounded()) }
+            return "\(w.appKey)|\(w.windowTitle)|\(w.displayUUID)|\(w.spaceIndex)|\(w.isFullscreen)|\(q(w.frame.x)),\(q(w.frame.y)),\(q(w.frame.width)),\(q(w.frame.height))"
+        }.sorted()
+    }
+
+    /// This snapshot with `intended` windows recorded at their intended positions instead of
+    /// wherever they are now. Windows a restore has not placed yet keep the position from the
+    /// layout being restored, so a half-finished restore never overwrites the good layout.
+    public func keeping(intended: [WindowSnapshotInfo]) -> MacSnapshot {
+        guard !intended.isEmpty else { return self }
+        let ids = Set(intended.map(\.windowNumber))
+        var copy = self
+        for d in copy.displays.indices {
+            for s in copy.displays[d].spaces.indices {
+                copy.displays[d].spaces[s].windows.removeAll { ids.contains($0.windowNumber) }
+            }
+        }
+        for w in intended {
+            guard let d = copy.displays.firstIndex(where: { $0.uuid == w.displayUUID }),
+                  !copy.displays[d].spaces.isEmpty else { continue }
+            let s = copy.displays[d].spaces.firstIndex(where: { $0.spaceIndex == w.spaceIndex }) ?? 0
+            copy.displays[d].spaces[s].windows.append(w)
+        }
+        return copy
     }
 }

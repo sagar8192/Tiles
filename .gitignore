@@ -1,6 +1,7 @@
 # Build & runtime artifacts
 .build/
 .swiftpm/
+build/
 Tiles.app/
 TilesData/
 

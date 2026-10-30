@@ -1,12 +1,19 @@
-APP_NAME := Tiles
-APP_DIR  := /Users/sagar/Applications/Mac Apps/Tiles/$(APP_NAME).app
+APP_NAME    := Tiles
+APP_DIR     := build/$(APP_NAME).app
+INSTALL_DIR := $(HOME)/Applications/$(APP_NAME).app
+DATA_DIR    ?= $(HOME)/Library/Application Support/$(APP_NAME)
+LOG_FILE    := $(DATA_DIR)/tiles.log
+ID          ?=
 
-.PHONY: all build stop start restart test logs
+.PHONY: all build install stop start restart test logs restore save diagnose
 
 all: build
 
 build:
-	@"/Users/sagar/Applications/Mac Apps/Tiles/build_app.sh"
+	@./build_app.sh
+
+install:
+	@./build_app.sh --install
 
 stop:
 	@osascript -e 'tell application "$(APP_NAME)" to quit' 2>/dev/null || true
@@ -14,25 +21,32 @@ stop:
 	@sleep 0.5
 
 start:
-	@open "$(APP_DIR)" || ("$(APP_DIR)/Contents/MacOS/$(APP_NAME)" >/dev/null 2>&1 &)
+	@open "$(INSTALL_DIR)" || open "$(APP_DIR)" || ("$(APP_DIR)/Contents/MacOS/$(APP_NAME)" >/dev/null 2>&1 &)
 
-restart: build stop start
-	@echo "✅ $(APP_NAME).app rebuilt and restarted."
+restart: install stop start
+	@echo "✅ $(APP_NAME).app rebuilt, installed, and restarted."
 
 test:
-	@swiftc -module-cache-path /tmp/swift-module-cache -target arm64-apple-macosx14.0 \
-		Sources/Tiles/Models.swift \
-		Sources/Tiles/SpaceBridge.swift \
-		Sources/Tiles/DisplayHelper.swift \
-		Sources/Tiles/WindowEngine.swift \
-		Sources/Tiles/SnapshotStore.swift \
-		"/Users/sagar/.gemini/antigravity/brain/d7b74e99-81e0-476e-bea7-709c0516f74f/scratch/verify_tiles.swift" \
-		-o /tmp/verify_tiles && /tmp/verify_tiles
+	@CLANG_MODULE_CACHE_PATH=/tmp/clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/swiftpm-cache swift test --disable-sandbox
 
 logs:
-	@cat "/Users/sagar/Applications/Mac Apps/Tiles/TilesData/tiles.log" 2>/dev/null || echo "No logs yet."
+	@cat "$(LOG_FILE)" 2>/dev/null || echo "No logs yet."
 
 restore:
-	@swift -e 'import Foundation; DistributedNotificationCenter.default().postNotificationName(NSNotification.Name("com.sagar.Tiles.TriggerRestore"), object: nil, userInfo: nil, deliverImmediately: true)'
+	@if [ -n "$(ID)" ]; then \
+		swift -module-cache-path /tmp/swift-module-cache -e 'import Foundation; DistributedNotificationCenter.default().postNotificationName(NSNotification.Name("com.sagar.Tiles.TriggerRestore"), object: nil, userInfo: ["snapshot": "$(ID)"], deliverImmediately: true)'; \
+	else \
+		swift -module-cache-path /tmp/swift-module-cache -e 'import Foundation; DistributedNotificationCenter.default().postNotificationName(NSNotification.Name("com.sagar.Tiles.TriggerRestore"), object: nil, userInfo: nil, deliverImmediately: true)'; \
+	fi
 	@sleep 1
-	@tail -n 10 "/Users/sagar/Applications/Mac Apps/Tiles/TilesData/tiles.log"
+	@tail -n 15 "$(LOG_FILE)" 2>/dev/null || true
+
+save:
+	@swift -module-cache-path /tmp/swift-module-cache -e 'import Foundation; DistributedNotificationCenter.default().postNotificationName(NSNotification.Name("com.sagar.Tiles.TriggerSave"), object: nil, userInfo: nil, deliverImmediately: true)'
+	@sleep 1
+	@tail -n 10 "$(LOG_FILE)" 2>/dev/null || true
+
+diagnose:
+	@swift -module-cache-path /tmp/swift-module-cache -e 'import Foundation; DistributedNotificationCenter.default().postNotificationName(NSNotification.Name("com.sagar.Tiles.Diagnose"), object: nil, userInfo: nil, deliverImmediately: true)'
+	@sleep 2
+	@tail -n 30 "$(LOG_FILE)" 2>/dev/null || true

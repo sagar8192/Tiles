@@ -1,9 +1,30 @@
 import Foundation
 import AppKit
+import CoreGraphics
 import Combine
+import ServiceManagement
+
+public enum DashboardTab: String, CaseIterable, Identifiable {
+    case map = "Snapshot Map"
+    case log = "Activity Log"
+    case settings = "Settings"
+
+    public var id: String { rawValue }
+}
 
 @MainActor
 public final class TilesCoordinator: ObservableObject {
+    public static let allowedIntervals: [Int] = [15, 30, 60, 120, 300]
+    public static let allowedHistoryLimits: [Int] = [5, 10, 20, 50]
+
+    private enum DefaultsKeys {
+        static let autoSnapshot = "Tiles.isAutoSnapshotEnabled"
+        static let autoRestore = "Tiles.isAutoRestoreEnabled"
+        static let intervalSeconds = "Tiles.snapshotIntervalSeconds"
+        static let historyLimit = "Tiles.historyLimit"
+        static let openAtLogin = "Tiles.openAtLogin"
+    }
+
     @Published public var customDisplayNames: [String: String] = [:]
     @Published public var connectedDisplays: [(
         uuid: String,
@@ -17,39 +38,154 @@ public final class TilesCoordinator: ObservableObject {
     @Published public var availableTopologies: [String] = []
     @Published public var viewingTopologyKey: String = ""
     @Published public var recentSnapshots: [MacSnapshot] = []
+    @Published public var pinsByTopology: [String: String] = [:]
     @Published public var selectedSnapshotID: String?
-    @Published public var secondsUntilNextSnapshot: Int = 60
-    @Published public var isAutoSnapshotEnabled: Bool = true
+    @Published public var secondsUntilNextSnapshot: Int = 30
+
+    @Published public var isAutoSnapshotEnabled: Bool = true {
+        didSet {
+            guard !isInitializing else { return }
+            defaults.set(isAutoSnapshotEnabled, forKey: DefaultsKeys.autoSnapshot)
+            if isAutoSnapshotEnabled {
+                secondsUntilNextSnapshot = snapshotIntervalSeconds
+            }
+        }
+    }
+
+    @Published public var isAutoRestoreEnabled: Bool = true {
+        didSet {
+            guard !isInitializing else { return }
+            defaults.set(isAutoRestoreEnabled, forKey: DefaultsKeys.autoRestore)
+        }
+    }
+
+    @Published public var snapshotIntervalSeconds: Int = 30 {
+        didSet {
+            guard !isInitializing else { return }
+            defaults.set(snapshotIntervalSeconds, forKey: DefaultsKeys.intervalSeconds)
+            secondsUntilNextSnapshot = snapshotIntervalSeconds
+        }
+    }
+
+    @Published public var historyLimit: Int = 10 {
+        didSet {
+            guard !isInitializing else { return }
+            defaults.set(historyLimit, forKey: DefaultsKeys.historyLimit)
+            store.maxSnapshotsPerTopology = historyLimit
+            store.pruneAllTopologies()
+            reloadSnapshotsFromDisk()
+        }
+    }
+
+    @Published public var openAtLogin: Bool = false {
+        didSet {
+            guard !isInitializing else { return }
+            defaults.set(openAtLogin, forKey: DefaultsKeys.openAtLogin)
+            do {
+                if openAtLogin {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try SMAppService.mainApp.unregister()
+                }
+            } catch {
+                store.appendLog("Open at login update failed: \(error.localizedDescription)")
+                lastStatusMessage = "Login item error: \(error.localizedDescription)"
+            }
+        }
+    }
+
     @Published public var isAccessibilityGranted: Bool = false
     @Published public var lastStatusMessage: String = "Ready"
     @Published public var isTransitioningDisplays: Bool = false
     @Published public var selectedSpaceByDisplay: [String: Int] = [:]
     @Published public var editingDisplayNames: [String: String] = [:]
+    @Published public var selectedDashboardTab: DashboardTab = .map {
+        didSet {
+            if selectedDashboardTab == .log {
+                refreshActivityLog()
+            }
+        }
+    }
+    @Published public var activityLogText: String = ""
+    @Published public var logSearchFilter: String = ""
 
-    public let snapshotIntervalSeconds: Int = 60
     public let store: SnapshotStore
+    private let defaults: UserDefaults
+    private var isInitializing: Bool = true
 
     private var countdownTimer: Timer?
+    private var timerTickCount: Int = 0
     private var displaySettleWorkItem: DispatchWorkItem?
+    private var wakeFreezeWorkItem: DispatchWorkItem?
+    private var wakeFreezeUntil: Date = .distantPast
     private var spaceChangeWorkItem: DispatchWorkItem?
     private var previousTopologyKey: String = ""
 
-    public init(store: SnapshotStore = SnapshotStore(maxSnapshotsPerTopology: 10)) {
+    private var activeRestore: MacSnapshot?
+    private var waiting: [String: SpaceRef] = [:]
+    private var placedWindowIDs: Set<CGWindowID> = []
+    private var consecutiveEmptyExternalSkips: Int = 0
+
+    public init(
+        store: SnapshotStore = SnapshotStore(),
+        defaults: UserDefaults = .standard
+    ) {
         self.store = store
+        self.defaults = defaults
+
+        let savedAutoSnap = defaults.object(forKey: DefaultsKeys.autoSnapshot) as? Bool ?? true
+        let savedAutoRestore = defaults.object(forKey: DefaultsKeys.autoRestore) as? Bool ?? true
+        let rawInterval = defaults.object(forKey: DefaultsKeys.intervalSeconds) as? Int ?? 30
+        let validInterval = Self.allowedIntervals.contains(rawInterval) ? rawInterval : 30
+        let rawLimit = defaults.object(forKey: DefaultsKeys.historyLimit) as? Int ?? 10
+        let validLimit = Self.allowedHistoryLimits.contains(rawLimit) ? rawLimit : 10
+        let savedLogin = (SMAppService.mainApp.status == .enabled)
+            || (defaults.object(forKey: DefaultsKeys.openAtLogin) as? Bool ?? false)
+
+        self.isAutoSnapshotEnabled = savedAutoSnap
+        self.isAutoRestoreEnabled = savedAutoRestore
+        self.snapshotIntervalSeconds = validInterval
+        self.secondsUntilNextSnapshot = validInterval
+        self.historyLimit = validLimit
+        self.openAtLogin = savedLogin
+        self.store.maxSnapshotsPerTopology = validLimit
+
         self.customDisplayNames = store.loadCustomDisplayNames()
+        self.pinsByTopology = store.loadPins()
         self.isAccessibilityGranted = WindowEngine.isAccessibilityTrusted(prompt: false)
 
         refreshDisplayList()
         self.previousTopologyKey = currentTopologyKey
         self.viewingTopologyKey = currentTopologyKey
         reloadSnapshotsFromDisk()
+        refreshActivityLog()
+        self.isInitializing = false
 
-        // Take an initial snapshot on launch ONLY if none exist yet for this display configuration
         if recentSnapshots.isEmpty {
-            takeSnapshotNow(reason: "Initial startup snapshot")
+            takeSnapshotNow(isManual: false, reason: "Initial startup snapshot")
         }
 
         startBackgroundTimersAndObservers()
+    }
+
+    private func clearActiveRestoreState() {
+        activeRestore = nil
+        waiting.removeAll()
+        placedWindowIDs.removeAll()
+    }
+
+    private func resumeTransitionsRespectingWakeFreeze() {
+        let remaining = wakeFreezeUntil.timeIntervalSinceNow
+        if remaining > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
+                guard let self = self, self.displaySettleWorkItem == nil else { return }
+                self.secondsUntilNextSnapshot = self.snapshotIntervalSeconds
+                self.isTransitioningDisplays = false
+            }
+        } else {
+            secondsUntilNextSnapshot = snapshotIntervalSeconds
+            isTransitioningDisplays = false
+        }
     }
 
     public var selectedSnapshot: MacSnapshot? {
@@ -58,6 +194,37 @@ public final class TilesCoordinator: ObservableObject {
             return match
         }
         return recentSnapshots.first
+    }
+
+    public func isPinned(_ snapshot: MacSnapshot) -> Bool {
+        pinsByTopology[snapshot.topologyKey] == snapshot.id
+    }
+
+    public func pinSnapshot(_ snapshot: MacSnapshot) {
+        store.pinSnapshot(id: snapshot.id, forTopology: snapshot.topologyKey)
+        pinsByTopology = store.loadPins()
+        store.appendLog("Pinned snapshot \(snapshot.id.prefix(6)) as default for [\(snapshot.topologyKey)]")
+        reloadSnapshotsFromDisk()
+        lastStatusMessage = "Pinned snapshot as default"
+    }
+
+    public func unpinSnapshot(_ snapshot: MacSnapshot) {
+        store.unpin(forTopology: snapshot.topologyKey)
+        pinsByTopology = store.loadPins()
+        store.appendLog("Unpinned default snapshot for [\(snapshot.topologyKey)]")
+        reloadSnapshotsFromDisk()
+        lastStatusMessage = "Unpinned default snapshot"
+    }
+
+    public func deleteSnapshot(_ snapshot: MacSnapshot) {
+        store.deleteSnapshot(id: snapshot.id, forTopology: snapshot.topologyKey)
+        pinsByTopology = store.loadPins()
+        reloadSnapshotsFromDisk()
+        lastStatusMessage = "Deleted snapshot"
+    }
+
+    public func refreshActivityLog() {
+        activityLogText = store.readRecentLogLines(limit: 200)
     }
 
     /// Returns a human-readable label for a topology key (e.g. "Built-in Retina Display + Home 49\" Odyssey G9")
@@ -71,7 +238,6 @@ public final class TilesCoordinator: ObservableObject {
             if let live = connectedDisplays.first(where: { $0.uuid == uuid }) {
                 return live.customName
             }
-            // Check saved snapshots for that topology to find the display's system/custom name
             let snaps = store.loadSnapshots(forTopology: key)
             if let disp = snaps.first?.displays.first(where: { $0.uuid == uuid }) {
                 return disp.customName
@@ -84,13 +250,13 @@ public final class TilesCoordinator: ObservableObject {
     public func selectViewingTopology(_ key: String) {
         viewingTopologyKey = key
         recentSnapshots = store.loadSnapshots(forTopology: key)
+        pinsByTopology = store.loadPins()
         selectedSnapshotID = recentSnapshots.first?.id
     }
 
     public func checkAccessibility(prompt: Bool) {
         isAccessibilityGranted = WindowEngine.isAccessibilityTrusted(prompt: prompt)
         if !isAccessibilityGranted && prompt {
-            // Also open System Settings -> Privacy & Security -> Accessibility directly so the user can toggle it easily
             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
                 NSWorkspace.shared.open(url)
             }
@@ -117,6 +283,7 @@ public final class TilesCoordinator: ObservableObject {
     public func reloadSnapshotsFromDisk() {
         let targetKey = viewingTopologyKey.isEmpty ? currentTopologyKey : viewingTopologyKey
         recentSnapshots = store.loadSnapshots(forTopology: targetKey)
+        pinsByTopology = store.loadPins()
         if selectedSnapshotID == nil || !recentSnapshots.contains(where: { $0.id == selectedSnapshotID }) {
             selectedSnapshotID = recentSnapshots.first?.id
         }
@@ -129,24 +296,35 @@ public final class TilesCoordinator: ObservableObject {
 
     // MARK: - Snapshot & Restore Actions
 
-    public func takeSnapshotNow(reason: String = "Auto-snapshot") {
+    public func takeSnapshotNow(isManual: Bool = false, reason: String = "Auto-snapshot") {
         guard !isTransitioningDisplays else { return }
         refreshDisplayList()
 
-        let snapshot = WindowEngine.captureCurrentMacSnapshot(
+        if isManual {
+            clearActiveRestoreState()
+        }
+
+        var snapshot = WindowEngine.captureCurrentMacSnapshot(
             customDisplayNames: customDisplayNames,
             logger: { [weak self] msg in self?.store.appendLog(msg) }
         )
+        snapshot.isManual = isManual
         guard !snapshot.displays.isEmpty else { return }
 
-        // Sanity Guard: If this is an automatic timer snapshot for a multi-display configuration
-        // that includes an external monitor, and the external monitor currently has 0 windows
-        // WHILE our newest saved snapshot for this exact configuration had windows on that external monitor,
-        // do NOT overwrite the good history with an un-restored / empty external display state!
-        let isManual = reason.localizedCaseInsensitiveContains("Manual") || reason.localizedCaseInsensitiveContains("Initial")
+        if !isManual,
+           let active = activeRestore,
+           active.topologyKey == snapshot.topologyKey,
+           !waiting.isEmpty {
+            let intended = active.displays
+                .flatMap { $0.spaces.flatMap(\.windows) }
+                .filter { waiting[$0.id] != nil }
+            snapshot = snapshot.keeping(intended: intended)
+        }
+
         if !isManual {
             let existing = store.loadSnapshots(forTopology: snapshot.topologyKey)
             if let latestGood = existing.first {
+                var triggeredEmptyExternalGuard: (name: String, prevCount: Int)? = nil
                 for disp in snapshot.displays where !disp.isBuiltIn {
                     let newWinCountOnExt = disp.spaces.reduce(0) { $0 + $1.windows.count }
                     let prevWinCountOnExt = latestGood.displays
@@ -154,40 +332,61 @@ public final class TilesCoordinator: ObservableObject {
                         .spaces.reduce(0, { $0 + $1.windows.count }) ?? 0
 
                     if newWinCountOnExt == 0 && prevWinCountOnExt > 0 {
-                        store.appendLog("Skipped auto-snapshot for [\(snapshot.topologyKey)]: external display '\(disp.customName)' has 0 windows while previous snapshot had \(prevWinCountOnExt) windows.")
-                        secondsUntilNextSnapshot = snapshotIntervalSeconds
-                        return
+                        triggeredEmptyExternalGuard = (disp.customName, prevWinCountOnExt)
+                        break
                     }
                 }
+
+                if let guardHit = triggeredEmptyExternalGuard {
+                    if consecutiveEmptyExternalSkips < 3 {
+                        consecutiveEmptyExternalSkips += 1
+                        store.appendLog("Skipped auto-snapshot (\(consecutiveEmptyExternalSkips)/3) for [\(snapshot.topologyKey)]: external display '\(guardHit.name)' has 0 windows while previous snapshot had \(guardHit.prevCount) windows.")
+                        secondsUntilNextSnapshot = snapshotIntervalSeconds
+                        return
+                    } else {
+                        store.appendLog("Accepting empty external display snapshot for [\(snapshot.topologyKey)] after 3 consecutive skips.")
+                        consecutiveEmptyExternalSkips = 0
+                    }
+                } else {
+                    consecutiveEmptyExternalSkips = 0
+                }
             }
+        } else {
+            consecutiveEmptyExternalSkips = 0
         }
 
         do {
-            try store.saveSnapshot(snapshot)
-            viewingTopologyKey = currentTopologyKey
-            reloadSnapshotsFromDisk()
-            selectedSnapshotID = snapshot.id
+            let savedURL = try store.saveSnapshot(snapshot)
+            consecutiveEmptyExternalSkips = 0
             secondsUntilNextSnapshot = snapshotIntervalSeconds
 
-            let fmt = DateFormatter()
-            fmt.timeStyle = .short
-            lastStatusMessage = "\(reason) saved at \(fmt.string(from: snapshot.capturedAt)) (\(snapshot.totalWindowCount) windows)"
+            if savedURL != nil {
+                viewingTopologyKey = currentTopologyKey
+                reloadSnapshotsFromDisk()
+                selectedSnapshotID = snapshot.id
+                let fmt = DateFormatter()
+                fmt.timeStyle = .short
+                lastStatusMessage = "\(reason) saved at \(fmt.string(from: snapshot.capturedAt)) (\(snapshot.totalWindowCount) windows)"
+            } else {
+                store.appendLog("Skipped duplicate auto-snapshot for [\(snapshot.topologyKey)] (layout unchanged).")
+                lastStatusMessage = "Auto-snapshot skipped (unchanged)"
+            }
+            if selectedDashboardTab == .log {
+                refreshActivityLog()
+            }
         } catch {
             lastStatusMessage = "Failed to write snapshot: \(error.localizedDescription)"
         }
     }
 
-    public func restoreSnapshot(_ snapshot: MacSnapshot? = nil, onlyCurrentSpaces: Bool = false) {
-        let activeTopologySnapshots = store.loadSnapshots(forTopology: currentTopologyKey)
-        guard let target = snapshot ?? activeTopologySnapshots.first else {
+    public func restoreSnapshot(_ snapshot: MacSnapshot? = nil) {
+        guard let target = snapshot ?? store.preferredRestoreSnapshot(forTopology: currentTopologyKey) else {
             let msg = "No saved snapshot found for configuration: \(friendlyName(forTopologyKey: currentTopologyKey))"
             lastStatusMessage = msg
             store.appendLog(msg)
             return
         }
 
-        // Check silently first; if TCC was just reset or not yet bound to our certificate,
-        // prompt once when the user explicitly clicks Restore!
         isAccessibilityGranted = WindowEngine.isAccessibilityTrusted(prompt: false)
         if !isAccessibilityGranted {
             isAccessibilityGranted = WindowEngine.isAccessibilityTrusted(prompt: true)
@@ -201,13 +400,49 @@ public final class TilesCoordinator: ObservableObject {
 
         let report = WindowEngine.restore(
             snapshot: target,
-            onlyCurrentSpaces: onlyCurrentSpaces,
             logger: { [weak self] msg in self?.store.appendLog(msg) }
         )
-        pendingSpaceRestoreSnapshot = target
+        activeRestore = target
+        waiting = report.waiting
+        placedWindowIDs = report.placedWindowIDs
+
+        if selectedDashboardTab == .log {
+            refreshActivityLog()
+        }
+
         let fmt = DateFormatter()
         fmt.timeStyle = .short
-        lastStatusMessage = "Restored \(report.restoredCount) windows for [\(friendlyName(forTopologyKey: target.topologyKey))] from \(fmt.string(from: target.capturedAt))"
+        let waitSuffix = report.waiting.isEmpty ? "" : " (\(report.waiting.count) waiting)"
+        lastStatusMessage = "Restored \(report.restoredCount) windows\(waitSuffix) for [\(friendlyName(forTopologyKey: target.topologyKey))] from \(fmt.string(from: target.capturedAt))"
+    }
+
+    public func restoreSnapshotMatchingPrefix(_ prefix: String) {
+        let trimmed = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            restoreSnapshot(nil)
+            return
+        }
+
+        let lower = trimmed.lowercased()
+        let currentSnaps = store.loadSnapshots(forTopology: currentTopologyKey)
+        if let match = currentSnaps.first(where: { $0.id.lowercased().hasPrefix(lower) }) {
+            store.appendLog("Restoring snapshot matching prefix '\(trimmed)' -> \(match.id)")
+            restoreSnapshot(match)
+            return
+        }
+
+        for topo in store.availableTopologies() where topo != currentTopologyKey {
+            let snaps = store.loadSnapshots(forTopology: topo)
+            if let match = snaps.first(where: { $0.id.lowercased().hasPrefix(lower) }) {
+                store.appendLog("Restoring snapshot matching prefix '\(trimmed)' -> \(match.id)")
+                restoreSnapshot(match)
+                return
+            }
+        }
+
+        let msg = "No snapshot found matching ID prefix '\(trimmed)'."
+        store.appendLog(msg)
+        lastStatusMessage = msg
     }
 
     // MARK: - Background Daemon & System Notifications
@@ -216,20 +451,24 @@ public final class TilesCoordinator: ObservableObject {
         countdownTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                self.isAccessibilityGranted = WindowEngine.isAccessibilityTrusted(prompt: false)
+                self.timerTickCount += 1
+
+                if self.timerTickCount % 2 == 0 {
+                    self.isAccessibilityGranted = WindowEngine.isAccessibilityTrusted(prompt: false)
+                    if self.selectedDashboardTab == .log {
+                        self.refreshActivityLog()
+                    }
+                }
+
                 guard self.isAutoSnapshotEnabled, !self.isTransitioningDisplays else { return }
 
                 self.secondsUntilNextSnapshot -= 1
-                if self.secondsUntilNextSnapshot % 5 == 0 {
-                    self.reloadSnapshotsFromDisk()
-                }
                 if self.secondsUntilNextSnapshot <= 0 {
-                    self.takeSnapshotNow(reason: "Auto 60s snapshot")
+                    self.takeSnapshotNow(isManual: false, reason: "Auto-snapshot")
                 }
             }
         }
 
-        // Observe ANY Display Configuration Change (External Monitor Plug/Unplug, Lid Close/Open Clamshell, etc.)
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
@@ -240,19 +479,64 @@ public final class TilesCoordinator: ObservableObject {
             }
         }
 
-        // Allow CLI / Makefile to trigger an immediate restore via DistributedNotificationCenter
-        DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("com.sagar.Tiles.TriggerRestore"),
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.store.appendLog("Received external TriggerRestore notification.")
-                self?.restoreSnapshot(nil, onlyCurrentSpaces: false)
+                self?.handleDidWake()
             }
         }
 
-        // Observe Desktop (Space) Switches (`Control + Left/Right Arrow` or Mission Control swipe)
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.sagar.Tiles.TriggerRestore"),
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let prefix = notification.userInfo?["snapshot"] as? String
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                if let prefix = prefix, !prefix.isEmpty {
+                    self.store.appendLog("Received external TriggerRestore notification (snapshot=\(prefix)).")
+                    self.restoreSnapshotMatchingPrefix(prefix)
+                } else {
+                    self.store.appendLog("Received external TriggerRestore notification.")
+                    self.restoreSnapshot(nil)
+                }
+            }
+        }
+
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.sagar.Tiles.TriggerSave"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                self.store.appendLog("Received external TriggerSave notification.")
+                self.takeSnapshotNow(isManual: true, reason: "Manual snapshot")
+            }
+        }
+
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.sagar.Tiles.Diagnose"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                self.store.appendLog("Received external Diagnose notification.")
+                WindowEngine.diagnoseReachableWindows { [weak self] msg in
+                    self?.store.appendLog(msg)
+                }
+                if self.selectedDashboardTab == .log {
+                    self.refreshActivityLog()
+                }
+                self.lastStatusMessage = "Diagnostics logged to tiles.log"
+            }
+        }
+
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.activeSpaceDidChangeNotification,
             object: nil,
@@ -264,10 +548,29 @@ public final class TilesCoordinator: ObservableObject {
         }
     }
 
-    private var pendingSpaceRestoreSnapshot: MacSnapshot?
+    private func handleDidWake() {
+        isTransitioningDisplays = true
+        secondsUntilNextSnapshot = snapshotIntervalSeconds
+        wakeFreezeUntil = Date().addingTimeInterval(8.0)
+        lastStatusMessage = "System woke from sleep — settling displays..."
+        store.appendLog("System woke from sleep — freezing snapshots for 8s.")
+
+        wakeFreezeWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                self.wakeFreezeWorkItem = nil
+                guard self.displaySettleWorkItem == nil else { return }
+                self.secondsUntilNextSnapshot = self.snapshotIntervalSeconds
+                self.isTransitioningDisplays = false
+                self.lastStatusMessage = "Ready"
+            }
+        }
+        wakeFreezeWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0, execute: work)
+    }
 
     private func handleScreenParametersChanged() {
-        // Freeze automatic snapshots immediately so a mid-transition state never overwrites our 10 good snapshots!
         isTransitioningDisplays = true
         secondsUntilNextSnapshot = snapshotIntervalSeconds
         lastStatusMessage = "Display configuration change detected — settling..."
@@ -276,36 +579,51 @@ public final class TilesCoordinator: ObservableObject {
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
+                self.displaySettleWorkItem = nil
+
                 let oldTopology = self.previousTopologyKey
                 self.refreshDisplayList()
                 let newTopology = self.currentTopologyKey
+
+                guard oldTopology != newTopology else {
+                    self.store.appendLog("Screen parameters updated within same topology [\(newTopology)] — skipping auto-restore.")
+                    self.lastStatusMessage = "Display parameters updated"
+                    self.resumeTransitionsRespectingWakeFreeze()
+                    return
+                }
+
                 self.previousTopologyKey = newTopology
                 self.viewingTopologyKey = newTopology
+                self.clearActiveRestoreState()
+                self.consecutiveEmptyExternalSkips = 0
                 self.reloadSnapshotsFromDisk()
 
                 self.store.appendLog("Display configuration changed: [\(oldTopology)] -> [\(newTopology)]")
 
-                // Whenever the display configuration changes (whether adding a monitor, unplugging to laptop-only,
-                // or closing the lid into external-only clamshell mode), restore the newest snapshot for `newTopology`!
-                if let latestForNewConfig = self.recentSnapshots.first {
-                    self.store.appendLog("Auto-restoring latest snapshot (\(latestForNewConfig.id)) for configuration [\(newTopology)]")
-                    self.restoreSnapshot(latestForNewConfig, onlyCurrentSpaces: false)
+                guard self.isAutoRestoreEnabled else {
+                    self.store.appendLog("Auto-restore is disabled in settings — skipping restore for [\(newTopology)].")
+                    self.lastStatusMessage = "Switched to \(self.friendlyName(forTopologyKey: newTopology))"
+                    self.resumeTransitionsRespectingWakeFreeze()
+                    return
+                }
 
-                    // Wait an extra 4 seconds before allowing auto-snapshots to resume, giving any un-fullscreen
-                    // animations time to finish!
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
-                        self.secondsUntilNextSnapshot = self.snapshotIntervalSeconds
-                        self.isTransitioningDisplays = false
+                if let preferredForNewConfig = self.store.preferredRestoreSnapshot(forTopology: newTopology) {
+                    let isPin = self.isPinned(preferredForNewConfig)
+                    self.store.appendLog("Auto-restoring \(isPin ? "pinned" : "latest") snapshot (\(preferredForNewConfig.id)) for configuration [\(newTopology)]")
+                    self.restoreSnapshot(preferredForNewConfig)
+
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+                        self?.resumeTransitionsRespectingWakeFreeze()
                     }
                 } else {
-                    // First time ever seeing this display configuration — record initial snapshot after settle
-                    self.isTransitioningDisplays = false
-                    self.takeSnapshotNow(reason: "Initial snapshot for new configuration")
+                    self.resumeTransitionsRespectingWakeFreeze()
+                    if !self.isTransitioningDisplays {
+                        self.takeSnapshotNow(isManual: false, reason: "Initial snapshot for new configuration")
+                    }
                 }
             }
         }
         displaySettleWorkItem = work
-        // Wait 2.5 seconds for macOS display negotiation & WindowServer migration to settle
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
     }
 
@@ -314,19 +632,120 @@ public final class TilesCoordinator: ObservableObject {
         spaceChangeWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self = self else { return }
+                guard let self = self, !self.isTransitioningDisplays else { return }
                 self.objectWillChange.send()
-                if let snap = self.pendingSpaceRestoreSnapshot ?? self.recentSnapshots.first,
-                   self.isAccessibilityGranted {
-                    _ = WindowEngine.restore(
-                        snapshot: snap,
-                        onlyCurrentSpaces: true,
-                        logger: { [weak self] msg in self?.store.appendLog("[SpaceSwitch] " + msg) }
-                    )
+                guard !self.waiting.isEmpty,
+                      let snap = self.activeRestore,
+                      self.isAccessibilityGranted else { return }
+
+                let spaceMap = SpaceBridge.queryAllDisplaySpaces()
+                var showingSpaces: Set<SpaceRef> = []
+                for (dispUUID, entries) in spaceMap.spacesByDisplayUUID {
+                    for entry in entries where entry.isCurrent {
+                        showingSpaces.insert(SpaceRef(displayUUID: dispUUID, spaceIndex: entry.index))
+                    }
+                }
+
+                let dueEntries = self.waiting.filter { showingSpaces.contains($0.value) }
+                guard !dueEntries.isEmpty else { return }
+
+                let dueIDs = Set(dueEntries.keys)
+                for id in dueIDs {
+                    self.waiting.removeValue(forKey: id)
+                }
+
+                let report = WindowEngine.restore(
+                    snapshot: snap,
+                    onlySavedWindowIDs: dueIDs,
+                    excludingLiveWindowIDs: self.placedWindowIDs,
+                    logger: { [weak self] msg in self?.store.appendLog("[SpaceSwitch] " + msg) }
+                )
+                self.placedWindowIDs.formUnion(report.placedWindowIDs)
+
+                for (id, newRef) in report.waiting {
+                    if let oldRef = dueEntries[id], newRef != oldRef {
+                        self.waiting[id] = newRef
+                    }
                 }
             }
         }
         spaceChangeWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    public func restoreSnapshotAtIndex(_ index: Int) {
+        guard index >= 0 && index < recentSnapshots.count else { return }
+        restoreSnapshot(recentSnapshots[index])
+    }
+
+    /// Short 2-3 character profile abbreviation for the narrow navigation rail (e.g. "2D", "1D", "49")
+    public func topologyNickname(for key: String) -> String {
+        let uuids = key.components(separatedBy: "__").filter { !$0.isEmpty }
+        if uuids.count > 1 {
+            let snaps = store.loadSnapshots(forTopology: key)
+            if snaps.first?.displays.contains(where: { $0.frame.width >= 3840 }) == true {
+                return "49"
+            }
+            if connectedDisplays.contains(where: { $0.quartzFrame.width >= 3840 }) {
+                return "49"
+            }
+            return "\(uuids.count)D"
+        } else if uuids.count == 1 {
+            return "1D"
+        }
+        return "ALL"
+    }
+
+    /// Extracts up to `limit` distinct app names from a snapshot for pastel pill tags
+    public func topApps(for snapshot: MacSnapshot, limit: Int = 3) -> [String] {
+        var seen = Set<String>()
+        var apps: [String] = []
+        for d in snapshot.displays {
+            for s in d.spaces {
+                for w in s.windows {
+                    let name = w.ownerName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !name.isEmpty, !seen.contains(name.lowercased()) else { continue }
+                    seen.insert(name.lowercased())
+                    apps.append(name)
+                    if apps.count >= limit { return apps }
+                }
+            }
+        }
+        return apps
+    }
+
+    /// Computes how many windows have moved live compared to this saved snapshot
+    public func driftSummary(for snapshot: MacSnapshot) -> (driftCount: Int, label: String) {
+        guard let latest = recentSnapshots.first else {
+            return (0, "Live match")
+        }
+        if snapshot.id == latest.id {
+            return (0, "Live match")
+        }
+        let latestWindows = latest.displays.flatMap { $0.spaces.flatMap(\.windows) }
+        var latestMap: [String: WindowSnapshotInfo] = [:]
+        for w in latestWindows {
+            latestMap["\(w.appKey)|\(w.windowTitle)"] = w
+        }
+
+        var moved = 0
+        let currentWindows = snapshot.displays.flatMap { $0.spaces.flatMap(\.windows) }
+        for w in currentWindows {
+            if let match = latestMap["\(w.appKey)|\(w.windowTitle)"] {
+                let dx = abs(w.frame.x - match.frame.x)
+                let dy = abs(w.frame.y - match.frame.y)
+                let dw = abs(w.frame.width - match.frame.width)
+                let dh = abs(w.frame.height - match.frame.height)
+                if dx > 15 || dy > 15 || dw > 15 || dh > 15 {
+                    moved += 1
+                }
+            }
+        }
+
+        if moved == 0 {
+            return (0, "Matches live layout")
+        } else {
+            return (moved, "\(moved) moved live")
+        }
     }
 }
