@@ -48,16 +48,16 @@ public struct DashboardWindowView: View {
             Divider()
                 .overlay(Color.white.opacity(0.08))
 
-            // 3-Column Layout: Narrow Icon Rail | Snapshot Feed | Blueprint Detail
+            // 3-Column Layout: Setups Sidebar | Compact Snapshots Timeline | Blueprint Stage
             HStack(spacing: 0) {
-                profileAndTabRail
-                    .frame(width: 58)
+                setupsAndNavSidebar
+                    .frame(width: 235)
 
                 Divider()
                     .overlay(Color.white.opacity(0.08))
 
-                snapshotFeedColumn
-                    .frame(width: 300)
+                snapshotTimelineColumn
+                    .frame(width: 235)
 
                 Divider()
                     .overlay(Color.white.opacity(0.08))
@@ -66,7 +66,7 @@ public struct DashboardWindowView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(minWidth: 1040, minHeight: 680)
+        .frame(minWidth: 1080, minHeight: 680)
         .background(Color(red: 0.08, green: 0.09, blue: 0.11))
         .onAppear {
             syncEditingNames()
@@ -80,27 +80,44 @@ public struct DashboardWindowView: View {
         }
     }
 
-    // MARK: - 1. Precision Command Header
+    // MARK: - 1. Top Precision Command Bar
 
     private var commandHeaderBar: some View {
         HStack(spacing: 12) {
-            // Workspace Breadcrumb
+            // Prominent Setup Breadcrumb
+            let activeSetup = coordinator.setupInfo(for: coordinator.viewingTopologyKey.isEmpty ? coordinator.currentTopologyKey : coordinator.viewingTopologyKey)
+
             HStack(spacing: 8) {
                 Circle()
-                    .fill(coordinator.isAutoSnapshotEnabled ? Color.green : Color.orange)
+                    .fill(activeSetup.isConnected ? Color.green : Color.orange)
                     .frame(width: 7, height: 7)
 
-                Text("WORKSPACE / \(currentWorkspaceBreadcrumb)")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color.primary.opacity(0.9))
+                HStack(spacing: 4) {
+                    Text("SETUP /")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(Color.secondary)
+                    Text(activeSetup.title.uppercased())
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundStyle(Color.primary.opacity(0.95))
+                }
+
+                if activeSetup.isConnected {
+                    Text("ACTIVE")
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(Color.green.opacity(0.18))
+                        .foregroundStyle(Color.green)
+                        .clipShape(Capsule())
+                }
 
                 if coordinator.isAutoSnapshotEnabled {
                     Text("\(coordinator.secondsUntilNextSnapshot)s")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.green.opacity(0.14))
-                        .foregroundStyle(Color.green)
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(Color.white.opacity(0.06))
+                        .foregroundStyle(Color.secondary)
                         .clipShape(Capsule())
                 }
             }
@@ -119,7 +136,7 @@ public struct DashboardWindowView: View {
                     .lineLimit(1)
             }
 
-            // Command Shortcut Badges
+            // Command Shortcut Actions
             HStack(spacing: 8) {
                 Button {
                     coordinator.takeSnapshotNow(isManual: true, reason: "Manual capture ⌘S")
@@ -204,100 +221,178 @@ public struct DashboardWindowView: View {
         .background(Color(red: 0.10, green: 0.11, blue: 0.13))
     }
 
-    private var currentWorkspaceBreadcrumb: String {
-        let key = coordinator.viewingTopologyKey.isEmpty ? coordinator.currentTopologyKey : coordinator.viewingTopologyKey
-        let friendly = coordinator.friendlyName(forTopologyKey: key).uppercased()
-        if friendly.count > 28 {
-            return String(friendly.prefix(25)) + "…"
-        }
-        return friendly
-    }
+    // MARK: - 2. Column 1: Prominent Setups Sidebar
 
-    // MARK: - 2. Left Icon Rail (Profiles & Tabs)
+    private var setupsAndNavSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack {
+                Text("DISPLAY SETUPS")
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundStyle(Color.secondary)
 
-    private var profileAndTabRail: some View {
-        VStack(spacing: 12) {
-            // Topology Profiles
-            VStack(spacing: 8) {
-                Text("SETUP")
-                    .font(.system(size: 8, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color.secondary.opacity(0.7))
-                    .padding(.top, 12)
+                Spacer()
 
-                ForEach(coordinator.availableTopologies, id: \.self) { topo in
-                    let isViewing = (topo == coordinator.viewingTopologyKey)
-                    let isLive = (topo == coordinator.currentTopologyKey)
-                    let nickname = coordinator.topologyNickname(for: topo)
+                Text("\(coordinator.allSetupInfos.count)")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1.5)
+                    .background(Color.white.opacity(0.06))
+                    .foregroundStyle(Color.secondary)
+                    .clipShape(Capsule())
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Color(red: 0.09, green: 0.10, blue: 0.12).opacity(0.6))
 
-                    Button {
-                        coordinator.selectViewingTopology(topo)
-                    } label: {
-                        ZStack(alignment: .topTrailing) {
-                            VStack(spacing: 1) {
-                                Text(nickname)
-                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                    .foregroundStyle(isViewing ? Color.white : Color.primary.opacity(0.75))
-                            }
-                            .frame(width: 40, height: 38)
-                            .background(isViewing ? Color.indigo : Color.white.opacity(0.06))
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .strokeBorder(isViewing ? Color.indigo.opacity(0.8) : Color.white.opacity(0.08), lineWidth: 1)
-                            )
+            Divider()
+                .overlay(Color.white.opacity(0.06))
 
-                            if isLive {
-                                Circle()
-                                    .fill(Color.green)
-                                    .frame(width: 6, height: 6)
-                                    .offset(x: -2, y: 3)
-                            }
-                        }
+            // Setups List
+            ScrollView {
+                VStack(spacing: 6) {
+                    ForEach(coordinator.allSetupInfos) { setup in
+                        setupCardView(setup: setup)
                     }
-                    .buttonStyle(.plain)
-                    .help(coordinator.friendlyName(forTopologyKey: topo) + (isLive ? " (Connected)" : ""))
                 }
+                .padding(10)
             }
 
-            Spacer()
+            Spacer(minLength: 0)
 
-            // Mode Tab Switcher Icons
-            VStack(spacing: 6) {
-                tabRailButton(tab: .map, icon: "rectangle.3.group.fill", title: "Blueprint Map (⇧⌘M)")
-                tabRailButton(tab: .log, icon: "list.bullet.rectangle.portrait", title: "Activity Log (⇧⌘L)")
-                tabRailButton(tab: .settings, icon: "gearshape.fill", title: "Preferences (⌘,)")
+            Divider()
+                .overlay(Color.white.opacity(0.06))
+
+            // Navigation Tabs at Bottom
+            VStack(spacing: 3) {
+                navTabRow(tab: .map, icon: "rectangle.3.group.fill", title: "Blueprint Map", shortcut: "⇧⌘M")
+                navTabRow(tab: .log, icon: "list.bullet.rectangle.portrait", title: "Activity Log", shortcut: "⇧⌘L")
+                navTabRow(tab: .settings, icon: "gearshape.fill", title: "Preferences", shortcut: "⌘,")
             }
-            .padding(.bottom, 14)
+            .padding(8)
+            .background(Color(red: 0.07, green: 0.08, blue: 0.10))
         }
-        .frame(maxWidth: .infinity)
         .background(Color(red: 0.09, green: 0.10, blue: 0.12))
     }
 
-    private func tabRailButton(tab: DashboardTab, icon: String, title: String) -> some View {
+    private func setupCardView(setup: TilesCoordinator.SetupInfo) -> some View {
+        let isSelected = (setup.topologyKey == coordinator.viewingTopologyKey)
+
+        return Button {
+            coordinator.selectViewingTopology(setup.topologyKey)
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                // Top Row: Title + Status
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: setup.icon)
+                        .font(.system(size: 13))
+                        .foregroundStyle(setup.isConnected ? Color.green : (isSelected ? Color.indigo : Color.secondary))
+                        .frame(width: 16)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(setup.title)
+                            .font(.system(size: 11, weight: isSelected ? .bold : .semibold))
+                            .foregroundStyle(Color.primary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+
+                        Text(setup.subtitle)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(Color.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 0)
+
+                    if setup.isConnected {
+                        Circle()
+                            .fill(Color.green)
+                            .frame(width: 6, height: 6)
+                            .padding(.top, 2)
+                    }
+                }
+
+                // Bottom row: Snapshots count + Pinned badge
+                HStack(spacing: 6) {
+                    if setup.hasPin {
+                        HStack(spacing: 2) {
+                            Image(systemName: "pin.fill")
+                                .font(.system(size: 8))
+                            Text("DEFAULT")
+                                .font(.system(size: 7.5, weight: .bold, design: .monospaced))
+                        }
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1.5)
+                        .background(Color.orange.opacity(0.18))
+                        .foregroundStyle(Color.orange)
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                    }
+
+                    Text("\(setup.snapshotCount) snap\(setup.snapshotCount == 1 ? "" : "s")")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Color.secondary.opacity(0.8))
+
+                    Spacer()
+
+                    if setup.isConnected {
+                        Text("LIVE")
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
+                            .foregroundStyle(Color.green)
+                    }
+                }
+                .padding(.top, 2)
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isSelected ? Color(red: 0.15, green: 0.17, blue: 0.22) : Color.white.opacity(0.025))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(
+                        isSelected ? Color.indigo.opacity(0.85) : (setup.isConnected ? Color.green.opacity(0.3) : Color.white.opacity(0.05)),
+                        lineWidth: isSelected ? 1.5 : 1
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func navTabRow(tab: DashboardTab, icon: String, title: String, shortcut: String) -> some View {
         let isSelected = (coordinator.selectedDashboardTab == tab)
         return Button {
             coordinator.selectedDashboardTab = tab
         } label: {
-            Image(systemName: icon)
-                .font(.system(size: 15))
-                .foregroundStyle(isSelected ? Color.white : Color.secondary)
-                .frame(width: 38, height: 38)
-                .background(isSelected ? Color.white.opacity(0.12) : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 9))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9)
-                        .strokeBorder(isSelected ? Color.white.opacity(0.2) : Color.clear, lineWidth: 1)
-                )
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.system(size: 12))
+                    .foregroundStyle(isSelected ? Color.white : Color.secondary)
+                    .frame(width: 16)
+
+                Text(title)
+                    .font(.system(size: 11, weight: isSelected ? .bold : .medium))
+                    .foregroundStyle(isSelected ? Color.white : Color.secondary)
+
+                Spacer()
+
+                Text(shortcut)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(Color.secondary.opacity(0.6))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(isSelected ? Color.white.opacity(0.10) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(.plain)
-        .help(title)
     }
 
-    // MARK: - 3. Middle Snapshot Feed Column
+    // MARK: - 3. Column 2: Compact Snapshots Timeline
 
-    private var snapshotFeedColumn: some View {
+    private var snapshotTimelineColumn: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Column Header
+            // Header
             HStack {
                 Text("SNAPSHOTS")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
@@ -306,21 +401,22 @@ public struct DashboardWindowView: View {
                 Spacer()
 
                 Text("\(coordinator.recentSnapshots.count)/\(coordinator.historyLimit)")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
                     .foregroundStyle(Color.secondary.opacity(0.8))
 
                 Button {
                     NSWorkspace.shared.open(coordinator.store.snapshotsRootDirectory)
                 } label: {
                     Image(systemName: "folder")
-                        .font(.system(size: 11))
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.secondary)
                 }
                 .buttonStyle(.plain)
-                .help("Show Snapshot Files in Finder")
+                .help("Show in Finder")
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 10)
             .padding(.vertical, 10)
-            .background(Color(red: 0.09, green: 0.10, blue: 0.12).opacity(0.6))
+            .background(Color(red: 0.08, green: 0.09, blue: 0.11).opacity(0.6))
 
             Divider()
                 .overlay(Color.white.opacity(0.06))
@@ -329,40 +425,39 @@ public struct DashboardWindowView: View {
                 VStack(spacing: 8) {
                     Spacer()
                     Image(systemName: "macwindow.badge.plus")
-                        .font(.system(size: 28))
+                        .font(.system(size: 22))
                         .foregroundStyle(Color.secondary.opacity(0.5))
-                    Text("No Snapshots Yet")
-                        .font(.headline)
+                    Text("No Snapshots")
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Color.secondary)
-                    Text("Tiles takes automatic background snapshots every \(coordinator.snapshotIntervalSeconds)s.")
-                        .font(.caption2)
+                    Text("Auto-saving every \(coordinator.snapshotIntervalSeconds)s.")
+                        .font(.system(size: 10))
                         .foregroundStyle(Color.secondary.opacity(0.7))
                         .multilineTextAlignment(.center)
-                        .padding(.horizontal, 16)
-                    Button("+ Capture Now") {
+                    Button("+ Capture") {
                         coordinator.takeSnapshotNow(isManual: true, reason: "Manual snapshot")
                     }
-                    .controlSize(.small)
+                    .controlSize(.mini)
                     .buttonStyle(.bordered)
-                    .padding(.top, 4)
                     Spacer()
                 }
                 .frame(maxWidth: .infinity)
+                .padding(12)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 8) {
+                    LazyVStack(spacing: 4) {
                         ForEach(Array(coordinator.recentSnapshots.enumerated()), id: \.element.id) { idx, snap in
-                            snapshotCard(index: idx, snap: snap)
+                            compactSnapshotCard(index: idx, snap: snap)
                         }
                     }
-                    .padding(10)
+                    .padding(6)
                 }
             }
         }
         .background(Color(red: 0.08, green: 0.09, blue: 0.11))
     }
 
-    private func snapshotCard(index: Int, snap: MacSnapshot) -> some View {
+    private func compactSnapshotCard(index: Int, snap: MacSnapshot) -> some View {
         let isSelected = (coordinator.selectedSnapshotID == snap.id)
         let isPin = coordinator.isPinned(snap)
         let shortcutKey = index < 9 ? "⌘\(index + 1)" : nil
@@ -372,101 +467,92 @@ public struct DashboardWindowView: View {
         return Button {
             coordinator.selectedSnapshotID = snap.id
         } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                // Top row: Pin / Index / Time / Shortcut
-                HStack(spacing: 6) {
-                    if isPin {
-                        HStack(spacing: 3) {
-                            Image(systemName: "pin.fill")
-                                .font(.system(size: 9))
-                            Text("DEFAULT")
-                                .font(.system(size: 8, weight: .bold, design: .monospaced))
-                        }
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(Color.orange.opacity(0.18))
-                        .foregroundStyle(Color.orange)
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
+            VStack(alignment: .leading, spacing: 3) {
+                // Row 1: Shortcut / Time / Default / Drift
+                HStack(spacing: 4) {
+                    if let sc = shortcutKey {
+                        Text(sc)
+                            .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 3.5)
+                            .padding(.vertical, 1)
+                            .background(Color.white.opacity(0.08))
+                            .foregroundStyle(Color.secondary)
+                            .clipShape(RoundedRectangle(cornerRadius: 3))
                     }
 
-                    Text(Self.shortTimeFormatter.string(from: snap.capturedAt))
-                        .font(.system(size: 11, weight: isSelected ? .bold : .semibold))
+                    if isPin {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 8))
+                            .foregroundStyle(Color.orange)
+                    }
+
+                    Text(Self.compactTimeFormatter.string(from: snap.capturedAt))
+                        .font(.system(size: 10.5, weight: isSelected ? .bold : .semibold))
                         .foregroundStyle(Color.primary)
 
                     if snap.isManual {
-                        Text("Manual")
-                            .font(.system(size: 8, weight: .medium))
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1.5)
-                            .background(Color.indigo.opacity(0.18))
+                        Text("M")
+                            .font(.system(size: 7.5, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 3)
+                            .padding(.vertical, 1)
+                            .background(Color.indigo.opacity(0.2))
                             .foregroundStyle(Color.indigo)
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                            .clipShape(RoundedRectangle(cornerRadius: 2.5))
                     }
 
                     Spacer()
 
-                    if let sc = shortcutKey {
-                        Text(sc)
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1.5)
-                            .background(Color.white.opacity(0.08))
-                            .foregroundStyle(Color.secondary)
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }
-                }
-
-                // Middle row: Pastel App Pills
-                if !topApps.isEmpty {
-                    HStack(spacing: 4) {
-                        ForEach(topApps, id: \.self) { appName in
-                            let palette = BentoPalette.colorForApp(appName)
-                            Text(appName)
-                                .font(.system(size: 9, weight: .bold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(palette.background)
-                                .foregroundStyle(palette.text)
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
-                                .lineLimit(1)
-                        }
-                    }
-                }
-
-                // Bottom row: Window count + Drift Status
-                HStack {
-                    Text("\(snap.totalWindowCount) win • \(snap.totalDesktopCount) spaces")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(Color.secondary)
-
-                    Spacer()
-
-                    HStack(spacing: 3) {
+                    HStack(spacing: 2) {
                         Circle()
                             .fill(drift.driftCount == 0 ? Color.green : Color.orange)
-                            .frame(width: 5, height: 5)
-                        Text(drift.label)
-                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .frame(width: 4.5, height: 4.5)
+                        Text(drift.driftCount == 0 ? "Match" : "\(drift.driftCount) diff")
+                            .font(.system(size: 8.5, weight: .medium, design: .monospaced))
                             .foregroundStyle(drift.driftCount == 0 ? Color.green : Color.orange)
                     }
                 }
+
+                // Row 2: Window Count + Compact App Chips
+                HStack(spacing: 4) {
+                    Text("\(snap.totalWindowCount)w")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Color.secondary)
+
+                    if !topApps.isEmpty {
+                        HStack(spacing: 3) {
+                            ForEach(topApps, id: \.self) { appName in
+                                let palette = BentoPalette.colorForApp(appName)
+                                Text(appName)
+                                    .font(.system(size: 7.5, weight: .bold))
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 1)
+                                    .background(palette.background)
+                                    .foregroundStyle(palette.text)
+                                    .clipShape(RoundedRectangle(cornerRadius: 2.5))
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    Spacer()
+                }
             }
-            .padding(10)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
             .background(
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(isSelected ? Color(red: 0.14, green: 0.16, blue: 0.20) : Color.white.opacity(0.03))
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(isSelected ? Color(red: 0.15, green: 0.17, blue: 0.22) : Color.white.opacity(0.025))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 10)
+                RoundedRectangle(cornerRadius: 7)
                     .strokeBorder(
-                        isSelected ? Color.indigo.opacity(0.8) : (isPin ? Color.orange.opacity(0.4) : Color.white.opacity(0.06)),
+                        isSelected ? Color.indigo.opacity(0.85) : (isPin ? Color.orange.opacity(0.35) : Color.white.opacity(0.05)),
                         lineWidth: isSelected ? 1.5 : 1
                     )
             )
         }
         .buttonStyle(.plain)
         .contextMenu {
-            Button("Restore This Layout") {
+            Button("Restore Layout") {
                 coordinator.restoreSnapshot(snap)
             }
             if isPin {
@@ -485,7 +571,7 @@ public struct DashboardWindowView: View {
         }
     }
 
-    // MARK: - 4. Main Stage (Detail View)
+    // MARK: - 4. Column 3: Main Stage (Detail View)
 
     @ViewBuilder
     private var mainStageContent: some View {
@@ -504,20 +590,41 @@ public struct DashboardWindowView: View {
     private var blueprintCanvasView: some View {
         Group {
             if let snap = coordinator.selectedSnapshot {
+                let currentSetup = coordinator.setupInfo(for: snap.topologyKey)
+
                 VStack(spacing: 0) {
                     // Stage Header Bar
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 6) {
+                            HStack(spacing: 8) {
                                 Text("Architectural Blueprint")
                                     .font(.headline)
                                 Text("•")
                                     .foregroundStyle(Color.secondary)
-                                Text(coordinator.friendlyName(forTopologyKey: snap.topologyKey))
+                                Text(currentSetup.title)
                                     .font(.subheadline)
-                                    .foregroundStyle(Color.secondary)
+                                    .fontWeight(.semibold)
+                                    .foregroundStyle(Color.primary)
+
+                                if currentSetup.isConnected {
+                                    Text("CURRENTLY ACTIVE")
+                                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1.5)
+                                        .background(Color.green.opacity(0.18))
+                                        .foregroundStyle(Color.green)
+                                        .clipShape(Capsule())
+                                } else {
+                                    Text("OFFLINE PROFILE")
+                                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1.5)
+                                        .background(Color.white.opacity(0.08))
+                                        .foregroundStyle(Color.secondary)
+                                        .clipShape(Capsule())
+                                }
                             }
-                            Text("Color-coded ceramic bento tiles • Live drift highlighted before restore")
+                            Text("\(snap.displays.count) Displays • \(snap.totalDesktopCount) Desktops • \(snap.totalWindowCount) Windows • Color-coded ceramic bento tiles")
                                 .font(.caption2)
                                 .foregroundStyle(Color.secondary.opacity(0.8))
                         }
@@ -563,7 +670,7 @@ public struct DashboardWindowView: View {
                 ContentUnavailableView(
                     "No Snapshot Selected",
                     systemImage: "macwindow.on.rectangle",
-                    description: Text("Select a snapshot from the sidebar to inspect its window blueprint.")
+                    description: Text("Select a snapshot from the timeline to inspect its window blueprint.")
                 )
             }
         }
@@ -1062,9 +1169,9 @@ public struct DashboardWindowView: View {
         .frame(width: 0, height: 0)
     }
 
-    private static let shortTimeFormatter: DateFormatter = {
+    private static let compactTimeFormatter: DateFormatter = {
         let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
+        f.dateFormat = "HH:mm"
         return f
     }()
 }

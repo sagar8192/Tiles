@@ -79,12 +79,13 @@ public struct MenuBarPopoverView: View {
     }
 
     private var currentTopologyShortBadge: String {
-        let nickname = coordinator.topologyNickname(for: coordinator.currentTopologyKey)
-        let friendly = coordinator.friendlyName(forTopologyKey: coordinator.currentTopologyKey).uppercased()
-        if friendly.contains("49") || friendly.contains("ULTRAWIDE") {
-            return "STUDIO-49"
+        let setup = coordinator.setupInfo(for: coordinator.currentTopologyKey)
+        if setup.title.contains("49\"") {
+            return "49\" + RETINA"
+        } else if setup.title.contains("Internal") {
+            return "BUILT-IN"
         }
-        return nickname
+        return setup.title.uppercased()
     }
 
     // MARK: - Primary Action Cards
@@ -106,7 +107,8 @@ public struct MenuBarPopoverView: View {
                     }
 
                     if let snap = preferred {
-                        Text("\(snap.totalWindowCount) windows remembered • \(snap.displays.count) screens")
+                        let setup = coordinator.setupInfo(for: snap.topologyKey)
+                        Text("\(setup.title) • \(snap.totalWindowCount) win")
                             .font(.system(size: 10, design: .monospaced))
                             .opacity(0.85)
                     } else {

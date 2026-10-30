@@ -247,6 +247,110 @@ public final class TilesCoordinator: ObservableObject {
         return names.joined(separator: " + ")
     }
 
+    public struct SetupInfo: Identifiable, Equatable {
+        public var id: String { topologyKey }
+        public let topologyKey: String
+        public let title: String
+        public let subtitle: String
+        public let icon: String
+        public let isConnected: Bool
+        public let snapshotCount: Int
+        public let hasPin: Bool
+
+        public init(
+            topologyKey: String,
+            title: String,
+            subtitle: String,
+            icon: String,
+            isConnected: Bool,
+            snapshotCount: Int,
+            hasPin: Bool
+        ) {
+            self.topologyKey = topologyKey
+            self.title = title
+            self.subtitle = subtitle
+            self.icon = icon
+            self.isConnected = isConnected
+            self.snapshotCount = snapshotCount
+            self.hasPin = hasPin
+        }
+    }
+
+    public func setupInfo(for key: String) -> SetupInfo {
+        let isConnected = (key == currentTopologyKey)
+        let snaps = store.loadSnapshots(forTopology: key)
+        let hasPin = pinsByTopology[key] != nil
+
+        let uuids = key.components(separatedBy: "__").filter { !$0.isEmpty }
+        var dispSummaries: [(name: String, width: Int, height: Int, isBuiltIn: Bool)] = []
+
+        for uuid in uuids {
+            let custom = customDisplayNames[uuid]
+            if let live = connectedDisplays.first(where: { $0.uuid == uuid }) {
+                let dName = (custom?.isEmpty == false) ? custom! : live.customName
+                dispSummaries.append((name: dName, width: Int(live.quartzFrame.width), height: Int(live.quartzFrame.height), isBuiltIn: live.isBuiltIn))
+            } else if let savedDisp = snaps.first?.displays.first(where: { $0.uuid == uuid }) {
+                let dName = (custom?.isEmpty == false) ? custom! : savedDisp.customName
+                dispSummaries.append((name: dName, width: Int(savedDisp.frame.width), height: Int(savedDisp.frame.height), isBuiltIn: savedDisp.isBuiltIn))
+            }
+        }
+
+        let title: String
+        let subtitle: String
+        let icon: String
+
+        if dispSummaries.count == 1 {
+            let d = dispSummaries[0]
+            if d.isBuiltIn {
+                let custom = customDisplayNames[uuids[0]]
+                title = (custom?.isEmpty == false) ? custom! : "Internal Display Only"
+                icon = "laptopcomputer"
+            } else {
+                let custom = customDisplayNames[uuids[0]]
+                title = (custom?.isEmpty == false) ? custom! : (d.width >= 3840 ? "49\" Ultrawide (Clamshell)" : d.name)
+                icon = "display"
+            }
+            subtitle = "\(d.width)×\(d.height) • 1 Screen"
+        } else if dispSummaries.count >= 2 {
+            let hasBuiltIn = dispSummaries.contains(where: { $0.isBuiltIn })
+            let ultrawide = dispSummaries.first(where: { $0.width >= 3840 })
+
+            if hasBuiltIn && ultrawide != nil {
+                title = "Internal Display + 49\" Ultrawide"
+                icon = "display.2"
+                let extW = ultrawide?.width ?? 5120
+                subtitle = "\(dispSummaries.count) Displays • \(extW)×\(ultrawide?.height ?? 1440) + Retina"
+            } else if hasBuiltIn {
+                let others = dispSummaries.filter { !$0.isBuiltIn }.map(\.name).joined(separator: " + ")
+                title = "Internal Display + \(others.isEmpty ? "External" : others)"
+                icon = "display.2"
+                subtitle = "\(dispSummaries.count) Displays Connected"
+            } else {
+                title = dispSummaries.map(\.name).joined(separator: " + ")
+                icon = "display.2"
+                subtitle = "\(dispSummaries.count) External Displays"
+            }
+        } else {
+            title = friendlyName(forTopologyKey: key)
+            subtitle = "Saved Configuration"
+            icon = "display"
+        }
+
+        return SetupInfo(
+            topologyKey: key,
+            title: title,
+            subtitle: subtitle,
+            icon: icon,
+            isConnected: isConnected,
+            snapshotCount: snaps.count,
+            hasPin: hasPin
+        )
+    }
+
+    public var allSetupInfos: [SetupInfo] {
+        availableTopologies.map { setupInfo(for: $0) }
+    }
+
     public func selectViewingTopology(_ key: String) {
         viewingTopologyKey = key
         recentSnapshots = store.loadSnapshots(forTopology: key)
