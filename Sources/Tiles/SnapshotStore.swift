@@ -45,6 +45,7 @@ public final class SnapshotStore {
         if shouldAttemptLegacyCopy {
             copyLegacyDataIfNeeded(explicitCandidate: legacyDataDirectory)
         }
+        seedAppPlacementsIfNeeded()
     }
 
     /// One-time non-destructive copy from the legacy `TilesData` folder into the new data folder
@@ -227,6 +228,65 @@ public final class SnapshotStore {
         return all.first
     }
 
+    // MARK: - Last Known App Placements per Topology (app_placements.json)
+
+    /// topologyKey -> appKey -> that app's windows the last time a saved snapshot of that setup
+    /// included it. Outlives the rolling history, so an app that was not running when a setup's
+    /// newest snapshot was taken can still be put back where it last was on that setup.
+    public typealias AppPlacements = [String: [String: [WindowSnapshotInfo]]]
+
+    public var appPlacementsFileURL: URL {
+        baseDirectory.appendingPathComponent("app_placements.json")
+    }
+
+    public func loadAppPlacements() -> AppPlacements {
+        guard let data = try? Data(contentsOf: appPlacementsFileURL),
+              let dict = try? decoder.decode(AppPlacements.self, from: data) else {
+            return [:]
+        }
+        return dict
+    }
+
+    /// Records every app in `snapshot` as its latest placement for the snapshot's setup.
+    /// Apps absent from `snapshot` keep their previous placement.
+    public func recordAppPlacements(from snapshot: MacSnapshot) {
+        var all = loadAppPlacements()
+        Self.merge(snapshot, into: &all)
+        if let data = try? encoder.encode(all) {
+            try? data.write(to: appPlacementsFileURL, options: .atomic)
+        }
+    }
+
+    /// Last known windows on `topologyKey` for each of `apps` that has a recorded placement.
+    public func lastKnownWindows(forTopology topologyKey: String, apps: Set<String>) -> [WindowSnapshotInfo] {
+        let forTopology = loadAppPlacements()[topologyKey] ?? [:]
+        return apps.sorted().flatMap { forTopology[$0] ?? [] }
+    }
+
+    private static func merge(_ snapshot: MacSnapshot, into all: inout AppPlacements) {
+        let windows = snapshot.displays.flatMap { $0.spaces.flatMap(\.windows) }
+        guard !windows.isEmpty else { return }
+        var forTopology = all[snapshot.topologyKey] ?? [:]
+        for (appKey, appWindows) in Dictionary(grouping: windows, by: \.appKey) {
+            forTopology[appKey] = appWindows
+        }
+        all[snapshot.topologyKey] = forTopology
+    }
+
+    /// First run with this feature: build placements from the existing history, oldest first,
+    /// so the newest snapshot that included each app wins.
+    private func seedAppPlacementsIfNeeded() {
+        guard !FileManager.default.fileExists(atPath: appPlacementsFileURL.path) else { return }
+        var all: AppPlacements = [:]
+        for topo in availableTopologies() {
+            for snap in loadSnapshots(forTopology: topo).reversed() {
+                Self.merge(snap, into: &all)
+            }
+        }
+        guard !all.isEmpty, let data = try? encoder.encode(all) else { return }
+        try? data.write(to: appPlacementsFileURL, options: .atomic)
+    }
+
     // MARK: - Rolling History Snapshots per Topology
 
     public var snapshotsRootDirectory: URL {
@@ -261,6 +321,7 @@ public final class SnapshotStore {
         let data = try encoder.encode(snapshot)
         try data.write(to: fileURL, options: .atomic)
 
+        recordAppPlacements(from: snapshot)
         pruneOldSnapshots(forTopology: snapshot.topologyKey)
         return fileURL
     }
@@ -327,7 +388,9 @@ public final class SnapshotStore {
         }
     }
 
-    /// Keeps the newest `maxSnapshotsPerTopology` unpinned snapshots plus the pinned snapshot (if any).
+    /// Keeps the newest `maxSnapshotsPerTopology` unpinned auto snapshots, the newest
+    /// `maxSnapshotsPerTopology` unpinned manual snapshots, plus the pinned snapshot (if any).
+    /// Manual and auto snapshots are capped separately so frequent auto-saves never evict a manual save.
     public func pruneOldSnapshots(forTopology topologyKey: String) {
         let directory = directory(forTopology: topologyKey)
         guard let files = try? FileManager.default.contentsOfDirectory(
@@ -339,23 +402,29 @@ public final class SnapshotStore {
         let pinnedID = pinnedSnapshotID(forTopology: topologyKey)
         let jsonFiles = files.filter { $0.pathExtension.lowercased() == "json" }
 
-        var unpinnedFiles: [(url: URL, date: Date)] = []
+        var autoFiles: [(url: URL, date: Date)] = []
+        var manualFiles: [(url: URL, date: Date)] = []
         for url in jsonFiles {
             if let data = try? Data(contentsOf: url),
                let snap = try? decoder.decode(MacSnapshot.self, from: data) {
                 if let pinnedID = pinnedID, snap.id == pinnedID {
                     continue
                 }
-                unpinnedFiles.append((url, snap.capturedAt))
+                if snap.isManual {
+                    manualFiles.append((url, snap.capturedAt))
+                } else {
+                    autoFiles.append((url, snap.capturedAt))
+                }
             } else {
-                unpinnedFiles.append((url, .distantPast))
+                autoFiles.append((url, .distantPast))
             }
         }
 
-        guard unpinnedFiles.count > maxSnapshotsPerTopology else { return }
-        unpinnedFiles.sort { $0.date > $1.date }
-        for item in unpinnedFiles.dropFirst(maxSnapshotsPerTopology) {
-            try? FileManager.default.removeItem(at: item.url)
+        for var group in [autoFiles, manualFiles] where group.count > maxSnapshotsPerTopology {
+            group.sort { $0.date > $1.date }
+            for item in group.dropFirst(maxSnapshotsPerTopology) {
+                try? FileManager.default.removeItem(at: item.url)
+            }
         }
     }
 }

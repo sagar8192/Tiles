@@ -23,6 +23,7 @@ public final class TilesCoordinator: ObservableObject {
         static let intervalSeconds = "Tiles.snapshotIntervalSeconds"
         static let historyLimit = "Tiles.historyLimit"
         static let openAtLogin = "Tiles.openAtLogin"
+        static let relaunchRestore = "Tiles.isRelaunchRestoreEnabled"
     }
 
     @Published public var customDisplayNames: [String: String] = [:]
@@ -56,6 +57,13 @@ public final class TilesCoordinator: ObservableObject {
         didSet {
             guard !isInitializing else { return }
             defaults.set(isAutoRestoreEnabled, forKey: DefaultsKeys.autoRestore)
+        }
+    }
+
+    @Published public var isRelaunchRestoreEnabled: Bool = true {
+        didSet {
+            guard !isInitializing else { return }
+            defaults.set(isRelaunchRestoreEnabled, forKey: DefaultsKeys.relaunchRestore)
         }
     }
 
@@ -126,6 +134,21 @@ public final class TilesCoordinator: ObservableObject {
     private var placedWindowIDs: Set<CGWindowID> = []
     private var consecutiveEmptyExternalSkips: Int = 0
 
+    /// An app that quit while the newest snapshot had windows for it. Until it relaunches (or the
+    /// record expires) auto-snapshots keep its windows where they were; on relaunch they are restored.
+    private struct RelaunchRecord {
+        let token = UUID()
+        let appName: String
+        let quitAt: Date
+        let source: MacSnapshot
+        let windows: [WindowSnapshotInfo]
+        var isRestoring = false
+    }
+    private static let relaunchHoldSeconds: TimeInterval = 600
+    /// Gaps between restore attempts after a relaunch: about 1, 2, 4, 8 and 15 s after launch.
+    private static let relaunchRetryGaps: [Double] = [1, 1, 2, 4, 7]
+    private var relaunchRecords: [String: RelaunchRecord] = [:]
+
     public init(
         store: SnapshotStore = SnapshotStore(),
         defaults: UserDefaults = .standard
@@ -135,6 +158,7 @@ public final class TilesCoordinator: ObservableObject {
 
         let savedAutoSnap = defaults.object(forKey: DefaultsKeys.autoSnapshot) as? Bool ?? true
         let savedAutoRestore = defaults.object(forKey: DefaultsKeys.autoRestore) as? Bool ?? true
+        let savedRelaunchRestore = defaults.object(forKey: DefaultsKeys.relaunchRestore) as? Bool ?? true
         let rawInterval = defaults.object(forKey: DefaultsKeys.intervalSeconds) as? Int ?? 30
         let validInterval = Self.allowedIntervals.contains(rawInterval) ? rawInterval : 30
         let rawLimit = defaults.object(forKey: DefaultsKeys.historyLimit) as? Int ?? 10
@@ -144,6 +168,7 @@ public final class TilesCoordinator: ObservableObject {
 
         self.isAutoSnapshotEnabled = savedAutoSnap
         self.isAutoRestoreEnabled = savedAutoRestore
+        self.isRelaunchRestoreEnabled = savedRelaunchRestore
         self.snapshotIntervalSeconds = validInterval
         self.secondsUntilNextSnapshot = validInterval
         self.historyLimit = validLimit
@@ -175,6 +200,7 @@ public final class TilesCoordinator: ObservableObject {
     }
 
     private func resumeTransitionsRespectingWakeFreeze() {
+        guard displaySettleWorkItem == nil else { return }
         let remaining = wakeFreezeUntil.timeIntervalSinceNow
         if remaining > 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
@@ -426,6 +452,14 @@ public final class TilesCoordinator: ObservableObject {
         }
 
         if !isManual {
+            expireRelaunchRecords()
+            let held = relaunchRecords.filter { $0.value.source.topologyKey == snapshot.topologyKey }
+            if !held.isEmpty {
+                snapshot = snapshot.keeping(apps: Set(held.keys), at: held.values.flatMap(\.windows))
+            }
+        }
+
+        if !isManual {
             let existing = store.loadSnapshots(forTopology: snapshot.topologyKey)
             if let latestGood = existing.first {
                 var triggeredEmptyExternalGuard: (name: String, prevCount: Int)? = nil
@@ -483,13 +517,32 @@ public final class TilesCoordinator: ObservableObject {
         }
     }
 
+    /// Adds last-known placements on `snapshot.topologyKey` for any currently running regular app
+    /// that has no windows in `snapshot` (because the app was closed when `snapshot` was captured).
+    private func supplementingMissingRunningApps(in snapshot: MacSnapshot) -> MacSnapshot {
+        let presentApps = Set(snapshot.displays.flatMap { $0.spaces.flatMap(\.windows) }.map(\.appKey))
+        var missingRunningApps: Set<String> = []
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            if let key = Self.appKey(for: app), !presentApps.contains(key) {
+                missingRunningApps.insert(key)
+            }
+        }
+        guard !missingRunningApps.isEmpty else { return snapshot }
+        let remembered = store.lastKnownWindows(forTopology: snapshot.topologyKey, apps: missingRunningApps)
+        guard !remembered.isEmpty else { return snapshot }
+        let names = Set(remembered.map(\.ownerName)).sorted().joined(separator: ", ")
+        store.appendLog("Supplementing snapshot \(snapshot.id.prefix(6)) with remembered placement(s) for running app(s): \(names)")
+        return snapshot.keeping(apps: missingRunningApps, at: remembered)
+    }
+
     public func restoreSnapshot(_ snapshot: MacSnapshot? = nil) {
-        guard let target = snapshot ?? store.preferredRestoreSnapshot(forTopology: currentTopologyKey) else {
+        guard let baseTarget = snapshot ?? store.preferredRestoreSnapshot(forTopology: currentTopologyKey) else {
             let msg = "No saved snapshot found for configuration: \(friendlyName(forTopologyKey: currentTopologyKey))"
             lastStatusMessage = msg
             store.appendLog(msg)
             return
         }
+        let target = supplementingMissingRunningApps(in: baseTarget)
 
         isAccessibilityGranted = WindowEngine.isAccessibilityTrusted(prompt: false)
         if !isAccessibilityGranted {
@@ -509,6 +562,7 @@ public final class TilesCoordinator: ObservableObject {
         activeRestore = target
         waiting = report.waiting
         placedWindowIDs = report.placedWindowIDs
+        secondsUntilNextSnapshot = max(secondsUntilNextSnapshot, snapshotIntervalSeconds)
 
         if selectedDashboardTab == .log {
             refreshActivityLog()
@@ -650,6 +704,121 @@ public final class TilesCoordinator: ObservableObject {
                 self?.handleActiveSpaceChanged()
             }
         }
+
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            Task { @MainActor [weak self] in
+                self?.handleAppTerminated(app)
+            }
+        }
+
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            Task { @MainActor [weak self] in
+                self?.handleAppLaunched(app)
+            }
+        }
+    }
+
+    // MARK: - App Relaunch Tracking
+
+    /// Same key as `WindowSnapshotInfo.appKey`: lowercased bundle ID, else app name.
+    private static func appKey(for app: NSRunningApplication) -> String? {
+        let raw = (app.bundleIdentifier?.isEmpty == false) ? app.bundleIdentifier! : (app.localizedName ?? "")
+        return raw.isEmpty ? nil : raw.lowercased()
+    }
+
+    private func handleAppTerminated(_ app: NSRunningApplication) {
+        guard let key = Self.appKey(for: app) else { return }
+        let snaps = store.loadSnapshots(forTopology: currentTopologyKey)
+        let windowsOf = { (snap: MacSnapshot) in
+            snap.displays.flatMap { $0.spaces.flatMap(\.windows) }.filter { $0.appKey == key }
+        }
+        // The newest snapshot may have been taken while the app was already closing its windows.
+        // In that case fall back to the one before it.
+        var source = snaps.first
+        if let newest = source, windowsOf(newest).isEmpty,
+           Date().timeIntervalSince(newest.capturedAt) < 60, snaps.count > 1 {
+            source = snaps[1]
+        }
+        guard let source else { return }
+        let windows = windowsOf(source)
+        guard !windows.isEmpty else { return }
+
+        let name = app.localizedName ?? key
+        relaunchRecords[key] = RelaunchRecord(appName: name, quitAt: Date(), source: source, windows: windows)
+        store.appendLog("[Relaunch] '\(name)' quit — holding its \(windows.count) window(s) for \(Int(Self.relaunchHoldSeconds / 60)) min in case it relaunches.")
+    }
+
+    private func handleAppLaunched(_ app: NSRunningApplication) {
+        guard let key = Self.appKey(for: app) else { return }
+        if relaunchRecords[key] == nil {
+            let remembered = store.lastKnownWindows(forTopology: currentTopologyKey, apps: [key])
+            if !remembered.isEmpty,
+               let base = store.preferredRestoreSnapshot(forTopology: currentTopologyKey) {
+                let name = app.localizedName ?? remembered.first?.ownerName ?? key
+                let enriched = base.keeping(apps: [key], at: remembered)
+                relaunchRecords[key] = RelaunchRecord(appName: name, quitAt: Date(), source: enriched, windows: remembered)
+            }
+        }
+        guard let record = relaunchRecords[key] else { return }
+        guard isRelaunchRestoreEnabled else {
+            relaunchRecords.removeValue(forKey: key)
+            store.appendLog("[Relaunch] '\(record.appName)' relaunched — relaunch restore is off, leaving its windows where they open.")
+            return
+        }
+
+        relaunchRecords[key]?.isRestoring = true
+        let token = record.token
+        store.appendLog("[Relaunch] '\(record.appName)' relaunched after \(Int(Date().timeIntervalSince(record.quitAt)))s — restoring \(record.windows.count) window(s).")
+
+        Task { @MainActor [weak self] in
+            var remaining = Set(record.windows.map(\.id))
+            var placed: Set<CGWindowID> = []
+            for gap in Self.relaunchRetryGaps where !remaining.isEmpty {
+                try? await Task.sleep(nanoseconds: UInt64(gap * 1_000_000_000))
+                guard let self, self.relaunchRecords[key]?.token == token else { return }
+                let report = WindowEngine.restore(
+                    snapshot: record.source,
+                    onlySavedWindowIDs: remaining,
+                    excludingLiveWindowIDs: placed,
+                    logger: { [weak self] msg in self?.store.appendLog("[Relaunch] " + msg) }
+                )
+                remaining.subtract(report.matchedSavedIDs)
+                placed.formUnion(report.placedWindowIDs)
+            }
+
+            // Keep holding the saved layout briefly so delayed frame changes (fullscreen exits take
+            // up to 3 s) finish before the next auto-snapshot records the app's live windows.
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self, self.relaunchRecords[key]?.token == token else { return }
+            self.relaunchRecords.removeValue(forKey: key)
+            let restored = record.windows.count - remaining.count
+            let msg = "[Relaunch] Finished '\(record.appName)': restored \(restored) of \(record.windows.count) window(s)."
+            self.store.appendLog(msg)
+            self.lastStatusMessage = "Restored \(restored) \(record.appName) window(s) after relaunch"
+            if self.selectedDashboardTab == .log {
+                self.refreshActivityLog()
+            }
+        }
+    }
+
+    /// Stops holding windows of apps that quit and never came back within `relaunchHoldSeconds`.
+    private func expireRelaunchRecords() {
+        let now = Date()
+        for (key, record) in relaunchRecords
+        where !record.isRestoring && now.timeIntervalSince(record.quitAt) > Self.relaunchHoldSeconds {
+            relaunchRecords.removeValue(forKey: key)
+            store.appendLog("[Relaunch] '\(record.appName)' did not relaunch within \(Int(Self.relaunchHoldSeconds / 60)) min — no longer holding its windows.")
+        }
     }
 
     private func handleDidWake() {
@@ -699,6 +868,7 @@ public final class TilesCoordinator: ObservableObject {
                 self.previousTopologyKey = newTopology
                 self.viewingTopologyKey = newTopology
                 self.clearActiveRestoreState()
+                self.relaunchRecords.removeAll()
                 self.consecutiveEmptyExternalSkips = 0
                 self.reloadSnapshotsFromDisk()
 

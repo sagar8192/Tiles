@@ -252,6 +252,113 @@ struct TilesTests {
         #expect(extWindows.contains(geminiIntendedOnExt))
     }
 
+    @Test("keeping(apps:at:) holds a relaunching app's saved windows: replaces wrong live ones, re-adds missing ones, leaves other apps alone")
+    func keepingAppsForRelaunch() {
+        let fixedDate = Date(timeIntervalSince1970: 1_700_000_000)
+        func snap(_ windows: [WindowSnapshotInfo]) -> MacSnapshot {
+            MacSnapshot(
+                id: "s",
+                capturedAt: fixedDate,
+                topologyKey: "EXT-49",
+                displays: [
+                    DisplaySnapshotInfo(
+                        uuid: "EXT-49", cgDisplayID: 2, systemName: "DGVIEW495K", customName: "Ultrawide",
+                        isBuiltIn: false, frame: CGRectCodable(x: 0, y: 0, width: 5120, height: 1440),
+                        spaces: [
+                            SpaceSnapshotInfo(spaceID: 1, spaceIndex: 1, isCurrentSpace: true, windows: windows.filter { $0.spaceIndex == 1 }),
+                            SpaceSnapshotInfo(spaceID: 2, spaceIndex: 2, isCurrentSpace: false, windows: windows.filter { $0.spaceIndex == 2 })
+                        ]
+                    )
+                ]
+            )
+        }
+        let claudeKey = "com.anthropic.claudefordesktop"
+        let chrome = makeWindow(windowNumber: 10, frame: CGRect(x: 0, y: 0, width: 2560, height: 1440))
+        let claudeSaved = makeWindow(windowNumber: 15558, ownerName: "Claude", bundleIdentifier: "com.anthropic.claudefordesktop",
+                                     windowTitle: "Claude", frame: CGRect(x: 2560, y: 0, width: 2560, height: 1440), spaceIndex: 2)
+        let claudeRelaunchedWrong = makeWindow(windowNumber: 20001, ownerName: "Claude", bundleIdentifier: "com.anthropic.claudefordesktop",
+                                               windowTitle: "Claude", frame: CGRect(x: 100, y: 100, width: 1200, height: 800), spaceIndex: 1)
+
+        // While quit: the app has no live windows, so its saved window is carried forward.
+        let whileQuit = snap([chrome]).keeping(apps: [claudeKey], at: [claudeSaved])
+        #expect(whileQuit.isEquivalent(to: snap([chrome, claudeSaved])))
+
+        // After relaunch, before restore: the new wrong-position window is replaced by the saved one.
+        let afterRelaunch = snap([chrome, claudeRelaunchedWrong]).keeping(apps: [claudeKey], at: [claudeSaved])
+        let all = afterRelaunch.displays.flatMap { $0.spaces.flatMap(\.windows) }
+        #expect(all.count == 2)
+        #expect(all.contains(chrome))
+        #expect(all.contains(claudeSaved))
+        #expect(!all.contains(claudeRelaunchedWrong))
+        #expect(afterRelaunch.displays[0].spaces[1].windows == [claudeSaved])
+
+        // No tracked apps: unchanged.
+        let initial = snap([chrome])
+        #expect(initial.keeping(apps: [], at: [claudeSaved]) == initial)
+    }
+
+    @Test("Fingerprint ignores window titles so tab or unread-count changes are not new layouts")
+    func fingerprintIgnoresTitles() {
+        func snap(title: String, x: Double) -> MacSnapshot {
+            MacSnapshot(
+                topologyKey: "EXT-49",
+                displays: [
+                    DisplaySnapshotInfo(
+                        uuid: "EXT-49", cgDisplayID: 2, systemName: "DGVIEW495K", customName: "Ultrawide",
+                        isBuiltIn: false, frame: CGRectCodable(x: 0, y: 0, width: 5120, height: 1440),
+                        spaces: [SpaceSnapshotInfo(spaceID: 1, spaceIndex: 1, isCurrentSpace: true, windows: [
+                            makeWindow(windowTitle: title, frame: CGRect(x: x, y: 0, width: 1600, height: 1200))
+                        ])]
+                    )
+                ]
+            )
+        }
+        #expect(snap(title: "Inbox (6,159) - Gmail", x: 0).isEquivalent(to: snap(title: "Home / X", x: 0)))
+        #expect(!snap(title: "Inbox", x: 0).isEquivalent(to: snap(title: "Inbox", x: 400)))
+    }
+
+    @Test("Pruning caps manual and auto snapshots separately so auto-saves never evict manual ones")
+    func pruningKeepsManualSnapshotsSeparately() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TilesManualPrune_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = SnapshotStore(baseDirectory: tempDir, maxSnapshotsPerTopology: 3)
+        let topo = "EXT-49"
+        let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+        func save(_ id: String, at i: Int, manual: Bool) throws {
+            try store.saveSnapshot(MacSnapshot(
+                id: id,
+                capturedAt: baseDate.addingTimeInterval(Double(i * 30)),
+                topologyKey: topo,
+                displays: [
+                    DisplaySnapshotInfo(
+                        uuid: "EXT-49", cgDisplayID: 2, systemName: "DGVIEW495K", customName: "Ultrawide",
+                        isBuiltIn: false, frame: CGRectCodable(x: 0, y: 0, width: 5120, height: 1440),
+                        spaces: [SpaceSnapshotInfo(spaceID: 1, spaceIndex: 1, isCurrentSpace: true, windows: [
+                            makeWindow(windowNumber: 300 + i, frame: CGRect(x: Double(i * 50), y: 0, width: 1600, height: 1200))
+                        ])]
+                    )
+                ],
+                isManual: manual
+            ))
+        }
+
+        try save("manual-1", at: 1, manual: true)
+        try save("manual-2", at: 2, manual: true)
+        for i in 3...10 { try save("auto-\(i)", at: i, manual: false) }
+
+        let ids = store.loadSnapshots(forTopology: topo).map(\.id)
+        // Newest 3 auto plus both manual snapshots survive.
+        #expect(ids == ["auto-10", "auto-9", "auto-8", "manual-2", "manual-1"])
+
+        for i in 11...13 { try save("manual-\(i)", at: i, manual: true) }
+        let afterManual = store.loadSnapshots(forTopology: topo).map(\.id)
+        // Manual snapshots are capped at 3 as well; auto snapshots are untouched.
+        #expect(afterManual == ["manual-13", "manual-12", "manual-11", "auto-10", "auto-9", "auto-8"])
+    }
+
     @Test("Fullscreen overlay filtering keeps largest window per app, preserves Split View, leaves normal desktops untouched")
     func fullscreenOverlayFiltering() {
         let candidates: [WindowEngine.CaptureWindowCandidate] = [
@@ -594,5 +701,69 @@ struct TilesTests {
 
         // Legacy files must still exist untouched!
         #expect(legacyStore.loadSnapshots(forTopology: "EXT-49").map(\.id) == ["legacy-snap-1"])
+    }
+
+    @Test("Per-topology app placement memory survives snapshots taken while an app was closed and seeds from existing history")
+    func appPlacementMemorySurvivesTemporaryAppAbsence() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TilesPlacements_\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let topo = "LAPTOP__EXT-49"
+        let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+        let chromeWin = makeWindow(windowNumber: 217, ownerName: "Google Chrome", bundleIdentifier: "com.google.Chrome",
+                                   frame: CGRect(x: -491, y: -1406, width: 2314, height: 1406), displayUUID: "EXT-49")
+        let geminiWin = makeWindow(windowNumber: 10945, ownerName: "Gemini", bundleIdentifier: "com.google.GeminiMacOS",
+                                   frame: CGRect(x: 1831, y: -1410, width: 1478, height: 1410), displayUUID: "EXT-49")
+        let claudeWin = makeWindow(windowNumber: 15558, ownerName: "Claude", bundleIdentifier: "com.anthropic.claudefordesktop",
+                                   frame: CGRect(x: -1808, y: -1408, width: 1316, height: 1408), displayUUID: "EXT-49")
+
+        func makeSnap(id: String, offset: Double, windows: [WindowSnapshotInfo]) -> MacSnapshot {
+            MacSnapshot(
+                id: id,
+                capturedAt: baseDate.addingTimeInterval(offset),
+                topologyKey: topo,
+                displays: [
+                    DisplaySnapshotInfo(
+                        uuid: "EXT-49", cgDisplayID: 2, systemName: "Odyssey G9", customName: "49\"",
+                        isBuiltIn: false, frame: CGRectCodable(x: -1811, y: -1440, width: 5120, height: 1440),
+                        spaces: [SpaceSnapshotInfo(spaceID: 1, spaceIndex: 1, isCurrentSpace: true, windows: windows)]
+                    )
+                ]
+            )
+        }
+
+        let store = SnapshotStore(baseDirectory: tempDir, maxSnapshotsPerTopology: 3)
+        // Snapshot 1 has Chrome, Gemini, and Claude on the 49" monitor.
+        try store.saveSnapshot(makeSnap(id: "with-claude", offset: 0, windows: [chromeWin, geminiWin, claudeWin]))
+        // Snapshots 2..5 are taken while Claude is not running (which even prunes "with-claude" from rolling history).
+        for i in 1...4 {
+            var movedChrome = chromeWin
+            movedChrome = makeWindow(windowNumber: 217, ownerName: "Google Chrome", bundleIdentifier: "com.google.Chrome",
+                                     frame: CGRect(x: Double(-491 + i * 20), y: -1406, width: 2314, height: 1406), displayUUID: "EXT-49")
+            try store.saveSnapshot(makeSnap(id: "without-claude-\(i)", offset: Double(i * 60), windows: [movedChrome, geminiWin]))
+        }
+
+        // Even though "with-claude" was pruned from the 3-slot history, Claude's placement on LAPTOP__EXT-49 is still remembered!
+        #expect(!store.loadSnapshots(forTopology: topo).map(\.id).contains("with-claude"))
+        let remembered = store.lastKnownWindows(forTopology: topo, apps: ["com.anthropic.claudefordesktop"])
+        #expect(remembered == [claudeWin])
+
+        // Also test one-time seeding when app_placements.json doesn't exist yet on an existing history directory.
+        try store.saveSnapshot(makeSnap(id: "with-claude-recent", offset: 300, windows: [chromeWin, claudeWin]))
+        try FileManager.default.removeItem(at: store.appPlacementsFileURL)
+        let seededStore = SnapshotStore(baseDirectory: tempDir, maxSnapshotsPerTopology: 3)
+        #expect(seededStore.lastKnownWindows(forTopology: topo, apps: ["com.anthropic.claudefordesktop"]) == [claudeWin])
+    }
+
+    @Test("appKeysWithGoneWindows identifies apps whose saved window IDs no longer exist after an app restart")
+    func appKeysWithGoneWindowsIdentifiesRestartedApps() {
+        let chromeWin = makeWindow(windowNumber: 217, ownerName: "Google Chrome", bundleIdentifier: "com.google.Chrome")
+        let geminiWin = makeWindow(windowNumber: 10945, ownerName: "Gemini", bundleIdentifier: "com.google.GeminiMacOS")
+        let claudeWin = makeWindow(windowNumber: 15558, ownerName: "Claude", bundleIdentifier: "com.anthropic.claudefordesktop")
+
+        // Chrome (217) and Gemini (10945) still have their original window IDs; Claude restarted and now has window ID 18963.
+        let gone = WindowEngine.appKeysWithGoneWindows([chromeWin, geminiWin, claudeWin], liveIDs: [217, 10945, 18963])
+        #expect(gone == ["com.anthropic.claudefordesktop"])
     }
 }

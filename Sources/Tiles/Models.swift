@@ -207,15 +207,17 @@ public struct MacSnapshot: Codable, Identifiable, Equatable {
         }
     }
 
-    /// Same apps with windows in the same places, ignoring sub-4 pt jitter and window IDs.
+    /// Same apps with windows in the same places, ignoring sub-4 pt jitter, window IDs and titles.
     public func isEquivalent(to other: MacSnapshot) -> Bool {
         topologyKey == other.topologyKey && fingerprint == other.fingerprint
     }
 
+    /// Titles are left out on purpose: tab switches and unread counts change them constantly,
+    /// and treating that as a new layout floods the rolling history.
     public var fingerprint: [String] {
         displays.flatMap { $0.spaces.flatMap(\.windows) }.map { w in
             let q = { (v: Double) in Int((v / 4).rounded()) }
-            return "\(w.appKey)|\(w.windowTitle)|\(w.displayUUID)|\(w.spaceIndex)|\(w.isFullscreen)|\(q(w.frame.x)),\(q(w.frame.y)),\(q(w.frame.width)),\(q(w.frame.height))"
+            return "\(w.appKey)|\(w.displayUUID)|\(w.spaceIndex)|\(w.isFullscreen)|\(q(w.frame.x)),\(q(w.frame.y)),\(q(w.frame.width)),\(q(w.frame.height))"
         }.sorted()
     }
 
@@ -238,5 +240,18 @@ public struct MacSnapshot: Codable, Identifiable, Equatable {
             copy.displays[d].spaces[s].windows.append(w)
         }
         return copy
+    }
+
+    /// This snapshot with every window of `apps` (app keys) replaced by `saved`. Used while an app
+    /// quits and relaunches, so neither the gap nor its new, wrong position overwrites its layout.
+    public func keeping(apps: Set<String>, at saved: [WindowSnapshotInfo]) -> MacSnapshot {
+        guard !apps.isEmpty else { return self }
+        var copy = self
+        for d in copy.displays.indices {
+            for s in copy.displays[d].spaces.indices {
+                copy.displays[d].spaces[s].windows.removeAll { apps.contains($0.appKey) }
+            }
+        }
+        return copy.keeping(intended: saved)
     }
 }

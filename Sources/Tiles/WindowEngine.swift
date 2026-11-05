@@ -509,7 +509,63 @@ public enum WindowEngine {
         public var skippedMissingCount: Int = 0
         public var waiting: [String: SpaceRef] = [:]
         public var placedWindowIDs: Set<CGWindowID> = []
+        /// `WindowSnapshotInfo.id`s of saved windows that were matched to a live window or already in place.
+        public var matchedSavedIDs: Set<String> = []
         public var details: [String] = []
+    }
+
+    /// App keys of saved windows whose window ID no longer exists (the app quit or relaunched).
+    public static func appKeysWithGoneWindows(_ saved: [WindowSnapshotInfo], liveIDs: Set<CGWindowID>) -> Set<String> {
+        Set(saved.filter { $0.windowNumber <= 0 || !liveIDs.contains(CGWindowID($0.windowNumber)) }.map(\.appKey))
+    }
+
+    /// For saved windows whose IDs are gone, the current window IDs of the same apps on desktops
+    /// that are not showing. Lets a relaunched app's new windows be found on hidden desktops
+    /// without picking up offscreen helper windows on the current desktop.
+    static func replacementWindowIDs(
+        for saved: [WindowSnapshotInfo],
+        spaceMap: DisplaySpacesMap
+    ) -> Set<CGWindowID> {
+        guard !spaceMap.spaceInfoByID.isEmpty,
+              let winList = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+            return []
+        }
+        var liveIDs: Set<CGWindowID> = []
+        var hiddenByPID: [Int32: [CaptureWindowCandidate]] = [:]
+        for w in winList {
+            guard let pid = w[kCGWindowOwnerPID as String] as? Int32,
+                  let layer = w[kCGWindowLayer as String] as? Int, layer == 0,
+                  let wid = w[kCGWindowNumber as String] as? UInt32, wid != 0 else { continue }
+            liveIDs.insert(wid)
+            let alpha = (w[kCGWindowAlpha as String] as? Double) ?? 1.0
+            guard alpha > 0.01,
+                  let b = w[kCGWindowBounds as String] as? [String: Any],
+                  let x = b["X"] as? Double, let y = b["Y"] as? Double,
+                  let width = b["Width"] as? Double, let height = b["Height"] as? Double,
+                  let firstSpace = SpaceBridge.spaceIDs(forWindowID: wid).first,
+                  let spaceInfo = spaceMap.spaceInfoByID[firstSpace],
+                  !spaceInfo.isCurrent else { continue }
+            hiddenByPID[pid, default: []].append(CaptureWindowCandidate(
+                windowNumber: Int(wid),
+                ownerPID: pid,
+                appKey: "\(pid)",
+                spaceID: firstSpace,
+                isFullscreenSpace: spaceInfo.isFullscreen,
+                frame: CGRect(x: x, y: y, width: width, height: height)
+            ))
+        }
+        let goneApps = appKeysWithGoneWindows(saved, liveIDs: liveIDs)
+        guard !goneApps.isEmpty else { return [] }
+
+        var result: Set<CGWindowID> = []
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            let key = ((app.bundleIdentifier?.isEmpty == false) ? app.bundleIdentifier! : (app.localizedName ?? "")).lowercased()
+            guard goneApps.contains(key), let candidates = hiddenByPID[app.processIdentifier] else { continue }
+            for c in filterCaptureCandidates(candidates) {
+                result.insert(CGWindowID(c.windowNumber))
+            }
+        }
+        return result
     }
 
     /// Restores windows from a `MacSnapshot` across all currently connected displays using global multi-pass matching.
@@ -562,7 +618,7 @@ public enum WindowEngine {
         }
 
         let wantedIDs = Set(targetWindows.compactMap { $0.windowNumber > 0 ? CGWindowID($0.windowNumber) : nil })
-        let liveAXWindows = collectLiveAXWindows(alsoFind: wantedIDs)
+        let liveAXWindows = collectLiveAXWindows(alsoFind: wantedIDs.union(replacementWindowIDs(for: targetWindows, spaceMap: liveSpaceMap)))
         let liveInfos = liveAXWindows.map { w in
             LiveWindowInfo(
                 windowID: w.cgWindowID,
@@ -606,6 +662,7 @@ public enum WindowEngine {
 
             if let match = matchBySavedIndex[sIdx] {
                 let matched = liveAXWindows[match.liveIndex]
+                report.matchedSavedIDs.insert(savedWin.id)
                 if matched.cgWindowID != 0 {
                     report.placedWindowIDs.insert(matched.cgWindowID)
                 }
@@ -689,6 +746,7 @@ public enum WindowEngine {
                 ) {
                 case .alreadyInPlace:
                     report.restoredCount += 1
+                    report.matchedSavedIDs.insert(savedWin.id)
                     if savedWin.windowNumber > 0 {
                         report.placedWindowIDs.insert(CGWindowID(savedWin.windowNumber))
                     }
@@ -841,7 +899,6 @@ public enum WindowEngine {
 
             let appAX = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(appAX, axMessagingTimeout)
-            _ = AXUIElementSetAttributeValue(appAX, "AXManualAccessibility" as CFString, kCFBooleanTrue)
 
             var windowsRef: CFTypeRef?
             let err = AXUIElementCopyAttributeValue(appAX, kAXWindowsAttribute as CFString, &windowsRef)
@@ -991,7 +1048,6 @@ public enum WindowEngine {
 
         if let appAX = appAX {
             AXUIElementSetMessagingTimeout(appAX, axMessagingTimeout)
-            _ = AXUIElementSetAttributeValue(appAX, "AXManualAccessibility" as CFString, kCFBooleanTrue)
 
             var enhancedRef: CFTypeRef?
             if AXUIElementCopyAttributeValue(appAX, "AXEnhancedUserInterface" as CFString, &enhancedRef) == .success,

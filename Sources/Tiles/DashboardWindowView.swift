@@ -963,6 +963,12 @@ public struct DashboardWindowView: View {
 
                             Divider()
 
+                            Toggle("Restore app windows after an app relaunches", isOn: $coordinator.isRelaunchRestoreEnabled)
+                                .font(.subheadline)
+                                .help("When an app quits and relaunches within 10 minutes (e.g. after an update), put its windows back.")
+
+                            Divider()
+
                             HStack {
                                 Text("Snapshot interval")
                                     .font(.subheadline)
