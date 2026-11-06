@@ -53,6 +53,8 @@ cat > "$CONTENTS_DIR/Info.plist" << 'EOF'
     <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSAccessibilityUsageDescription</key>
     <string>Tiles needs Accessibility access to read window positions across your displays and desktops and restore your saved layouts.</string>
 </dict>

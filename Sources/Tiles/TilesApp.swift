@@ -6,13 +6,7 @@ struct TilesApp: App {
     @StateObject private var coordinator = TilesCoordinator()
 
     var body: some Scene {
-        // 1. Primary Window: Multi-Display & Multi-Desktop Snapshot Map
-        WindowGroup("Tiles — All-Display & Desktop Snapshot Manager", id: "dashboard") {
-            DashboardWindowView(coordinator: coordinator)
-        }
-        .defaultSize(width: 1080, height: 700)
-
-        // 2. Always-On Menu Bar Extra for 60s background daemon & quick restore
+        // 1. Always-On Menu Bar Extra for background daemon & quick restore
         MenuBarExtra {
             MenuBarPopoverView(coordinator: coordinator)
         } label: {
@@ -22,5 +16,11 @@ struct TilesApp: App {
             }
         }
         .menuBarExtraStyle(.window)
+
+        // 2. Primary Window: Multi-Display & Multi-Desktop Snapshot Map (opened on demand from Menu Bar)
+        WindowGroup("Tiles — All-Display & Desktop Snapshot Manager", id: "dashboard") {
+            DashboardWindowView(coordinator: coordinator)
+        }
+        .defaultSize(width: 1080, height: 700)
     }
 }
